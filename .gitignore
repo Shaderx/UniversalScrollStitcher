@@ -1,6 +1,7 @@
 # CMake and Visual Studio output
 /build/
 /build_*/
+/build-audit/
 /out/
 /vcpkg_installed/
 /release-candidate/

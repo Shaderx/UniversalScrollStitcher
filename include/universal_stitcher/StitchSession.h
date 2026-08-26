@@ -21,11 +21,17 @@ struct StitchOptions {
 
 struct StitchUpdate {
     bool accepted = false;
+    // A frame that could not be registered against the pending frame. The
+    // session keeps the pending frame and stays live, so scrolling back up a
+    // little restores the overlap and capture continues without a gap.
+    bool rejected = false;
     bool paused = false;
     bool atTop = false;
     bool atBottom = false;
+    bool scrollbarVisible = false;
     int shift = 0;
     int expectedShift = 0;
+    int consecutiveRejections = 0;
     float confidence = 0.0F;
     float scrollbarConfidence = 0.0F;
     std::string message;
@@ -59,6 +65,13 @@ public:
     [[nodiscard]] const Rect& viewport() const noexcept { return options_.viewport; }
 
 private:
+    // Transient conditions must not end a long capture. A thumb that fades
+    // out, a duplicate frame, or a scroll that briefly outran the overlap all
+    // recover on their own; only a sustained failure escalates to Paused.
+    static constexpr int kInitialScrollbarMissPauseThreshold = 30;
+    static constexpr int kRejectionPauseThreshold = 50;
+    static constexpr int kThumbNoiseTolerance = 2;
+
     StitchOptions options_;
     ScrollbarState scrollbar_;
     cv::Mat pending_;
@@ -66,6 +79,8 @@ private:
     int pendingStart_ = 0;
     int acceptedFrames_ = 0;
     int outputRows_ = 0;
+    int consecutiveRejections_ = 0;
+    int consecutiveScrollbarMisses_ = 0;
     SessionState state_ = SessionState::Idle;
     std::string lastMessage_;
     StripStore store_;

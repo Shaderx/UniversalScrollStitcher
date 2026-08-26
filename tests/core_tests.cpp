@@ -49,6 +49,37 @@ cv::Mat fullFrame(int documentOffset, int thumbTop, int width = 120, int height 
     return frame;
 }
 
+// A frame whose scrollbar track starts below a band of window chrome, with the
+// thumb parked away from that boundary.
+cv::Mat chromeFrame(int thumbTop) {
+    constexpr int width = 160;
+    constexpr int height = 120;
+    constexpr int chromeHeight = 25;
+    constexpr int trackLeft = 152;
+    cv::Mat frame(height, width, CV_8UC4, cv::Scalar(25, 25, 25, 255));
+    documentFrame(0, trackLeft, height).copyTo(frame(cv::Rect(0, 0, trackLeft, height)));
+    for (int y = 0; y < chromeHeight; ++y) {
+        for (int x = 0; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(90, 90, 90, 255);
+    }
+    for (int y = chromeHeight; y < height; ++y) {
+        for (int x = trackLeft; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(210, 210, 210, 255);
+    }
+    for (int y = thumbTop; y < thumbTop + 25 && y < height; ++y) {
+        for (int x = trackLeft; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(35, 35, 35, 255);
+    }
+    return frame;
+}
+
+// A frame whose scrollbar track is present but whose thumb has faded out, as
+// overlay scrollbars do while the pointer is idle.
+cv::Mat thumblessFrame(int documentOffset) {
+    cv::Mat frame = fullFrame(documentOffset, 0);
+    for (int y = 0; y < frame.rows; ++y) {
+        for (int x = 112; x < 120; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(210, 210, 210, 255);
+    }
+    return frame;
+}
+
 cv::Mat multipleScrollbarFrame() {
     constexpr int width = 160;
     constexpr int height = 120;
@@ -80,9 +111,46 @@ void testShiftAndSeam() {
             "seam should stay inside the overlap guard band");
 }
 
+void testLargeWheelLikeShift() {
+    // Hash-textured rows so a large jump has one clear match and no ramp aliases.
+    constexpr int height = 120;
+    constexpr int width = 96;
+    constexpr int shift = 95; // ~21% overlap remaining
+    auto uniqueDocument = [](int firstRow) {
+        cv::Mat image(height, width, CV_8UC4);
+        for (int y = 0; y < height; ++y) {
+            const int documentY = firstRow + y;
+            for (int x = 0; x < width; ++x) {
+                const std::uint32_t hash = static_cast<std::uint32_t>(documentY) * 2246822519u +
+                                          static_cast<std::uint32_t>(x) * 3266489917u;
+                auto& pixel = image.at<cv::Vec4b>(y, x);
+                pixel[0] = static_cast<unsigned char>(hash & 0xff);
+                pixel[1] = static_cast<unsigned char>((hash >> 8) & 0xff);
+                pixel[2] = static_cast<unsigned char>((hash >> 16) & 0xff);
+                pixel[3] = 255;
+            }
+        }
+        return image;
+    };
+    const cv::Mat previous = uniqueDocument(0);
+    const cv::Mat current = uniqueDocument(shift);
+    // Misleading scrollbar prior: true shift is far outside the prior window.
+    const ShiftEstimate estimate = VerticalShiftEstimator::estimate(previous, current, 18);
+    require(estimate.accepted, "a large but overlapping wheel jump should still stitch");
+    require(estimate.shift == shift, "broad fallback should recover the true large shift");
+}
+
 void testDisagreementIsRejected() {
     const cv::Mat previous = documentFrame(0);
-    const cv::Mat unrelated = documentFrame(47);
+    cv::Mat unrelated(96, 96, CV_8UC4, cv::Scalar(7, 31, 99, 255));
+    for (int y = 0; y < unrelated.rows; ++y) {
+        for (int x = 0; x < unrelated.cols; ++x) {
+            unrelated.at<cv::Vec4b>(y, x) = cv::Vec4b(
+                static_cast<unsigned char>((x * 19 + y * 7) & 0xff),
+                static_cast<unsigned char>((x * 5 + 40) & 0xff),
+                static_cast<unsigned char>((y * 11 + 90) & 0xff), 255);
+        }
+    }
     ShiftEstimatorOptions options;
     options.minimumConfidence = 0.93F;
     const ShiftEstimate estimate = VerticalShiftEstimator::estimate(previous, unrelated, 8, options);
@@ -163,31 +231,158 @@ void testSessionAssembly() {
             "reset should discard finalized output and session state");
 }
 
-void testPausedSessionCanFinalizePrefix() {
+cv::Mat unregisterableFrame() {
+    cv::Mat unrelated = fullFrame(37, 20);
+    unrelated(cv::Rect(0, 0, 96, 96)).setTo(cv::Scalar(7, 31, 99, 255));
+    return unrelated;
+}
+
+void testRejectedFrameKeepsSessionLive() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(fullFrame(0, 2), options), "recovery test session should start");
+
+    const StitchUpdate rejected = session.process(unregisterableFrame());
+    require(rejected.rejected && !rejected.accepted, "an unregisterable frame should be rejected");
+    require(!rejected.paused && session.state() == SessionState::Capturing,
+            "a single rejection should not pause the session");
+
+    // The pending frame and the scrollbar baseline survive the rejection, so
+    // the very next usable frame stitches with no gap.
+    const StitchUpdate recovered = session.process(fullFrame(8, 6));
+    require(recovered.accepted, "the session should stitch again after a transient rejection");
+    require(recovered.shift == 8, "recovery should measure the displacement from the accepted baseline");
+    require(session.finish(), "a recovered session should finalize");
+    require(session.outputStore().rows() == 104,
+            "recovered output should be contiguous with no dropped rows");
+}
+
+void testSustainedRejectionEventuallyPauses() {
     StitchOptions options;
     options.viewport = {0, 0, 96, 96};
     options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
     StitchSession session;
     require(session.start(fullFrame(0, 2), options), "pause test session should start");
-    cv::Mat unrelated = fullFrame(37, 20);
-    unrelated(cv::Rect(0, 0, 96, 96)).setTo(cv::Scalar(7, 31, 99, 255));
-    const StitchUpdate update = session.process(unrelated);
-    require(update.paused, "a rejected visual overlap should pause the session");
+
+    const cv::Mat unrelated = unregisterableFrame();
+    bool paused = false;
+    for (int attempt = 0; attempt < 200 && !paused; ++attempt) {
+        paused = session.process(unrelated).paused;
+    }
+    require(paused, "sustained rejection should eventually pause the session");
     require(session.state() == SessionState::Paused, "session should report paused state");
     require(session.finish(), "stop should finalize the valid prefix after a pause");
     require(session.hasOutput() && session.outputStore().rows() == 96,
             "paused finalization should preserve the initial viewport");
 }
 
+void testDuplicateFrameIsNotAFailure() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(fullFrame(0, 2), options), "duplicate test session should start");
+
+    // The thumb animates while the content stays put; that is not a stitch and
+    // it is not an error either.
+    const StitchUpdate duplicate = session.process(fullFrame(0, 9));
+    require(!duplicate.accepted && !duplicate.rejected && !duplicate.paused,
+            "a duplicate frame should be neither stitched nor treated as a failure");
+    require(session.state() == SessionState::Capturing, "a duplicate frame should not end the session");
+    require(session.process(fullFrame(8, 6)).accepted,
+            "the session should still stitch after a duplicate frame");
+}
+
+void testSmallUpwardJitterIsTolerated() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(fullFrame(0, 6), options), "jitter test session should start");
+    const StitchUpdate jitter = session.process(fullFrame(0, 5));
+    require(!jitter.paused && session.state() == SessionState::Capturing,
+            "a one-pixel thumb wobble should not be read as upward scrolling");
+    const StitchUpdate upward = session.process(fullFrame(0, 40));
+    require(!upward.paused, "a downward move after jitter should still be evaluated");
+}
+
+void testVanishedThumbIsTolerated() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(fullFrame(0, 2), options), "overlay scrollbar session should start");
+    // A user may pause for an arbitrary amount of time while an overlay thumb
+    // is hidden. Once calibrated, disappearance alone must not end capture.
+    for (int frame = 0; frame < 100; ++frame) {
+        const StitchUpdate update = session.process(thumblessFrame(0));
+        require(!update.scrollbarVisible, "a faded thumb should be reported as not visible");
+        require(!update.paused, "a briefly faded overlay scrollbar should not pause the session");
+    }
+    require(session.process(fullFrame(8, 6)).accepted,
+            "capture should resume once the thumb reappears");
+}
+
+void testTrackExtentExcludesWindowChrome() {
+    const auto candidates = ScrollbarDetector::autoDetectAll(chromeFrame(45));
+    const ScrollbarCandidate* scrollbar = nullptr;
+    for (const auto& candidate : candidates) {
+        if (candidate.config.track.right() >= 158 &&
+            (!scrollbar || candidate.observation.confidence > scrollbar->observation.confidence)) {
+            scrollbar = &candidate;
+        }
+    }
+    require(scrollbar != nullptr, "the right-edge scrollbar should be detected");
+    // Reporting a track that starts at row 0 makes a document that is at the
+    // top look scrolled, because top-of-document state is measured against
+    // track.y.
+    require(scrollbar->config.track.y >= 20 && scrollbar->config.track.y <= 30,
+            "the detected track should start below the window chrome");
+    require(scrollbar->config.track.bottom() >= 115,
+            "the detected track should extend to the bottom of the scrollbar");
+    require(std::abs(scrollbar->observation.thumbTop() - 45) <= 2,
+            "the thumb should still be measured inside the tightened track");
+}
+
+void testTopOfDocumentIsRecognizedBelowChrome() {
+    const cv::Mat frame = chromeFrame(25);
+    const auto candidates = ScrollbarDetector::autoDetectAll(chromeFrame(45));
+    const ScrollbarCandidate* calibration = nullptr;
+    for (const auto& candidate : candidates) {
+        if (candidate.config.track.right() >= 158 &&
+            (!calibration || candidate.observation.confidence > calibration->observation.confidence)) {
+            calibration = &candidate;
+        }
+    }
+    require(calibration != nullptr, "calibration should produce a right-edge track");
+
+    StitchOptions options;
+    options.viewport = {0, 25, 152, 95};
+    options.scrollbar = calibration->config;
+    StitchSession session;
+    require(session.start(frame, options),
+            "a document already at the top should start with auto-detected calibration");
+    require(session.state() == SessionState::Capturing, "the session should be capturing");
+}
+
 } // namespace
 
 int main() {
     testShiftAndSeam();
+    testLargeWheelLikeShift();
     testDisagreementIsRejected();
     testScrollbarDetection();
     testMultipleScrollbarCandidates();
+    testTrackExtentExcludesWindowChrome();
+    testTopOfDocumentIsRecognizedBelowChrome();
     testSessionAssembly();
-    testPausedSessionCanFinalizePrefix();
+    testRejectedFrameKeepsSessionLive();
+    testSustainedRejectionEventuallyPauses();
+    testDuplicateFrameIsNotAFailure();
+    testSmallUpwardJitterIsTolerated();
+    testVanishedThumbIsTolerated();
     std::cout << "UniversalScrollStitcher core tests passed\n";
     return 0;
 }

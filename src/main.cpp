@@ -1,4 +1,5 @@
 #include "universal_stitcher/ImageExporter.h"
+#include "universal_stitcher/DiagnosticLogger.h"
 #include "universal_stitcher/StitchSession.h"
 #include "universal_stitcher/WindowCapture.h"
 
@@ -17,11 +18,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cwctype>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,7 +50,9 @@ enum ControlId : int {
     kTrackWidth = 132,
     kTrackHeight = 133,
     kStatus = 150,
-    kLatestRelease = 151
+    kLoggingEnable = 151,
+    kOpenLogs = 152,
+    kLatestRelease = 153
 };
 
 constexpr wchar_t kLatestReleaseUrl[] =
@@ -61,23 +67,26 @@ class MainWindow final {
 public:
     bool create(HINSTANCE instance) {
         instance_ = instance;
+        backgroundBrush_ = CreateSolidBrush(RGB(246, 248, 251));
+        cardBrush_ = CreateSolidBrush(RGB(255, 255, 255));
+        statusBrush_ = CreateSolidBrush(RGB(239, 246, 255));
         WNDCLASSEXW previewClass{sizeof(WNDCLASSEXW)};
         previewClass.lpfnWndProc = &MainWindow::previewProc;
         previewClass.hInstance = instance;
         previewClass.hCursor = LoadCursorW(nullptr, IDC_CROSS);
-        previewClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        previewClass.hbrBackground = backgroundBrush_;
         previewClass.lpszClassName = L"UniversalScrollStitcherPreview";
         if (!RegisterClassExW(&previewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
         WNDCLASSEXW klass{sizeof(WNDCLASSEXW)};
         klass.lpfnWndProc = &MainWindow::windowProc;
         klass.hInstance = instance;
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        klass.hbrBackground = backgroundBrush_;
         klass.lpszClassName = L"UniversalScrollStitcherWindow";
         if (!RegisterClassExW(&klass)) return false;
         window_ = CreateWindowExW(0, klass.lpszClassName, L"Universal Scroll Stitcher",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  820, 850, nullptr, nullptr, instance, this);
+                                  1040, 900, nullptr, nullptr, instance, this);
         if (!window_) return false;
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
@@ -86,15 +95,33 @@ public:
 
 private:
     static constexpr UINT_PTR kTimer = 1;
-    static constexpr UINT kTimerPeriodMs = 100;
+    // ~30 Hz is enough to catch mouse-wheel notches while staying responsive on
+    // the UI thread. Arrow-key scrolling was already fine at 10 Hz.
+    static constexpr UINT kTimerPeriodMs = 33;
+    static constexpr int kMaximumFramesPerTick = 6;
+    static constexpr int kMinimumClientWidth = 980;
+    static constexpr int kMinimumClientHeight = 760;
 
     HWND window_ = nullptr;
     HINSTANCE instance_ = nullptr;
     HWND targetCombo_ = nullptr;
     HWND previewCanvas_ = nullptr;
     HWND status_ = nullptr;
+    HWND title_ = nullptr;
+    HWND subtitle_ = nullptr;
+    HWND targetCard_ = nullptr;
+    HWND calibrationCard_ = nullptr;
+    HWND statusCard_ = nullptr;
+    HWND previewCard_ = nullptr;
+    HWND loggingCheckbox_ = nullptr;
+    HWND openLogsButton_ = nullptr;
     HWND latestReleaseLink_ = nullptr;
     HFONT latestReleaseFont_ = nullptr;
+    HFONT bodyFont_ = nullptr;
+    HFONT headingFont_ = nullptr;
+    HBRUSH backgroundBrush_ = nullptr;
+    HBRUSH cardBrush_ = nullptr;
+    HBRUSH statusBrush_ = nullptr;
     std::array<HWND, 4> viewportEdits_{};
     std::array<HWND, 4> trackEdits_{};
     std::vector<WindowInfo> windows_;
@@ -105,8 +132,11 @@ private:
     std::vector<ScrollbarCandidate> scrollbarCandidates_;
     std::optional<std::size_t> selectedScrollbarCandidate_;
     StitchSession session_;
+    DiagnosticLogger logger_;
     bool capturing_ = false;
     bool updatingCalibrationEdits_ = false;
+    std::uint64_t captureTickCount_ = 0;
+    std::uint64_t transientMissCount_ = 0;
 
     enum class CanvasTarget { None, Viewport, Track };
     enum CanvasEdge : int { EdgeNone = 0, EdgeLeft = 1, EdgeTop = 2, EdgeRight = 4, EdgeBottom = 8 };
@@ -165,28 +195,44 @@ private:
         case WM_COMMAND:
             if (HIWORD(wParam) == BN_CLICKED) onButton(LOWORD(wParam));
             if (LOWORD(wParam) == kLatestRelease && HIWORD(wParam) == STN_CLICKED) {
+                logger_.info("ui", "GitHub latest-release credit clicked");
                 ShellExecuteW(window_, L"open", kLatestReleaseUrl, nullptr, nullptr, SW_SHOWNORMAL);
             }
             if (HIWORD(wParam) == EN_CHANGE) {
                 const int id = LOWORD(wParam);
                 if (!updatingCalibrationEdits_ && id >= kTrackX && id <= kTrackHeight) {
                     selectedScrollbarCandidate_.reset();
+                    logger_.info("calibration", "manual scrollbar track edit changed to{" +
+                                 rectDescription(readRect(trackEdits_)) + "}");
+                } else if (!updatingCalibrationEdits_ && id >= kViewportX && id <= kViewportHeight) {
+                    logger_.info("calibration", "manual viewport edit changed to{" +
+                                 rectDescription(readRect(viewportEdits_)) + "}");
                 }
                 InvalidateRect(previewCanvas_, nullptr, FALSE);
             }
+            if (LOWORD(wParam) == kTargetCombo && HIWORD(wParam) == CBN_SELCHANGE) {
+                logger_.info("target", "selected " + windowDescription(selectedTarget()));
+            }
             return 0;
+        case WM_GETMINMAXINFO: {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            RECT desiredClient{0, 0, kMinimumClientWidth, kMinimumClientHeight};
+            UINT dpi = GetDpiForWindow(window_);
+            if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
+            RECT desiredWindow = desiredClient;
+            if (!AdjustWindowRectExForDpi(&desiredWindow, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi)) {
+                AdjustWindowRectEx(&desiredWindow, WS_OVERLAPPEDWINDOW, FALSE, 0);
+            }
+            limits->ptMinTrackSize.x = desiredWindow.right - desiredWindow.left;
+            limits->ptMinTrackSize.y = desiredWindow.bottom - desiredWindow.top;
+            return 0;
+        }
         case WM_TIMER:
             if (wParam == kTimer) captureTick();
             return 0;
         case WM_SIZE:
             if (wParam != SIZE_MINIMIZED) {
-                const int width = std::max(100, LOWORD(lParam) - 36);
-                const int clientHeight = HIWORD(lParam);
-                const int height = std::max(160, clientHeight - 478);
-                if (previewCanvas_) MoveWindow(previewCanvas_, 18, 425, width, height, TRUE);
-                if (latestReleaseLink_) {
-                    MoveWindow(latestReleaseLink_, 18, std::max(0, clientHeight - 38), width, 22, TRUE);
-                }
+                layoutControls(static_cast<int>(LOWORD(lParam)), static_cast<int>(HIWORD(lParam)));
                 // StretchDIBits uses the current child-client size on every
                 // paint. Force a complete child repaint here so resizing the
                 // main window immediately rescales the existing preview.
@@ -197,17 +243,26 @@ private:
             }
             return 0;
         case WM_CTLCOLORSTATIC:
-            if (reinterpret_cast<HWND>(lParam) == latestReleaseLink_) {
-                const HDC dc = reinterpret_cast<HDC>(wParam);
-                SetTextColor(dc, RGB(0, 102, 204));
-                SetBkMode(dc, TRANSPARENT);
-                return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
-            }
-            return DefWindowProcW(window_, message, wParam, lParam);
+            return colorStatic(reinterpret_cast<HWND>(lParam), reinterpret_cast<HDC>(wParam));
+        case WM_CTLCOLORBTN: {
+            const HDC dc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(backgroundBrush_);
+        }
+        case WM_DRAWITEM:
+            drawButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
         case WM_DESTROY:
             KillTimer(window_, kTimer);
             if (source_) source_->stop();
+            logger_.info("app", "shutdown");
+            logger_.disable();
             if (latestReleaseFont_) DeleteObject(latestReleaseFont_);
+            if (headingFont_) DeleteObject(headingFont_);
+            if (bodyFont_) DeleteObject(bodyFont_);
+            if (backgroundBrush_) DeleteObject(backgroundBrush_);
+            if (cardBrush_) DeleteObject(cardBrush_);
+            if (statusBrush_) DeleteObject(statusBrush_);
             PostQuitMessage(0);
             return 0;
         default:
@@ -216,76 +271,275 @@ private:
     }
 
     HWND addLabel(const wchar_t* text, int x, int y, int width = 180) {
-        return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
-                               x, y, width, 22, window_, nullptr, instance_, nullptr);
+        HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     x, y, width, 22, window_, nullptr, instance_, nullptr);
+        if (bodyFont_) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        return label;
     }
 
     HWND addButton(const wchar_t* text, int id, int x, int y, int width = 110) {
-        return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               x, y, width, 28, window_, menuId(id), instance_, nullptr);
+        HWND button = CreateWindowExW(0, L"BUTTON", text,
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_OWNERDRAW,
+                                      x, y, width, 34, window_, menuId(id), instance_, nullptr);
+        if (bodyFont_) SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        return button;
     }
 
     HWND addEdit(int id, int x, int y, int width = 70) {
-        return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0",
-                               WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                               x, y, width, 24, window_, menuId(id), instance_, nullptr);
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    x, y, width, 26, window_, menuId(id), instance_, nullptr);
+        if (bodyFont_) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        return edit;
     }
 
     void createControls() {
-        addLabel(L"Capture target window:", 18, 18, 150);
+        bodyFont_ = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        headingFont_ = CreateFontW(-30, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        title_ = addLabel(L"Universal Scroll Stitcher", 24, 20, 700);
+        subtitle_ = addLabel(L"Capture a long page from any visible window - locally, privately, and without injected input.",
+                             24, 58, 880);
+        if (headingFont_) SendMessageW(title_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
+
+        targetCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
+                                      24, 96, 900, 76, window_, nullptr, instance_, nullptr);
+        addLabel(L"Capture target window", 42, 116, 150);
         targetCombo_ = CreateWindowExW(0, L"COMBOBOX", nullptr,
-                                       WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST,
-                                       170, 14, 470, 240, window_, menuId(kTargetCombo), instance_, nullptr);
-        addButton(L"Refresh", kRefresh, 650, 14, 90);
-        addButton(L"Capture preview", kPreview, 18, 55, 125);
-        addButton(L"Auto-detect scrollbar", kAutoDetect, 152, 55, 165);
-        addButton(L"Start", kStart, 326, 55, 90);
-        addButton(L"Stop", kStop, 424, 55, 90);
-        addButton(L"Export PNG/JPEG", kExport, 522, 55, 125);
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | CBS_DROPDOWNLIST,
+                                       200, 112, 600, 260, window_, menuId(kTargetCombo), instance_, nullptr);
+        if (bodyFont_) SendMessageW(targetCombo_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        addButton(L"Refresh", kRefresh, 812, 110, 100);
 
-        addLabel(L"Content viewport (capture pixels)", 18, 105, 270);
-        addLabel(L"X", 18, 136, 20); addLabel(L"Y", 130, 136, 20);
-        addLabel(L"Width", 242, 136, 45); addLabel(L"Height", 354, 136, 50);
-        viewportEdits_[0] = addEdit(kViewportX, 38, 132);
-        viewportEdits_[1] = addEdit(kViewportY, 150, 132);
-        viewportEdits_[2] = addEdit(kViewportWidth, 290, 132);
-        viewportEdits_[3] = addEdit(kViewportHeight, 410, 132);
+        addButton(L"Capture preview", kPreview, 24, 184, 144);
+        addButton(L"Auto-detect scrollbar", kAutoDetect, 180, 184, 190);
+        addButton(L"Start capture", kStart, 382, 184, 130);
+        addButton(L"Stop", kStop, 524, 184, 100);
+        addButton(L"Export PNG / JPEG", kExport, 636, 184, 164);
 
-        addLabel(L"Scrollbar track (adjust if detection is wrong)", 18, 180, 330);
-        addLabel(L"X", 18, 211, 20); addLabel(L"Y", 130, 211, 20);
-        addLabel(L"Width", 242, 211, 45); addLabel(L"Height", 354, 211, 50);
-        trackEdits_[0] = addEdit(kTrackX, 38, 207);
-        trackEdits_[1] = addEdit(kTrackY, 150, 207);
-        trackEdits_[2] = addEdit(kTrackWidth, 290, 207);
-        trackEdits_[3] = addEdit(kTrackHeight, 410, 207);
+        calibrationCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
+                                           24, 232, 900, 130, window_, nullptr, instance_, nullptr);
+        addLabel(L"Calibration", 42, 246, 170);
+        addLabel(L"Content viewport (capture pixels)", 42, 273, 240);
+        addLabel(L"X", 42, 300, 18); addLabel(L"Y", 174, 300, 18);
+        addLabel(L"Width", 306, 300, 44); addLabel(L"Height", 444, 300, 50);
+        viewportEdits_[0] = addEdit(kViewportX, 62, 296, 96);
+        viewportEdits_[1] = addEdit(kViewportY, 194, 296, 96);
+        viewportEdits_[2] = addEdit(kViewportWidth, 352, 296, 78);
+        viewportEdits_[3] = addEdit(kViewportHeight, 500, 296, 96);
+        addLabel(L"Scrollbar track - adjust if detection is wrong", 630, 273, 270);
+        trackEdits_[0] = addEdit(kTrackX, 630, 296, 64);
+        trackEdits_[1] = addEdit(kTrackY, 702, 296, 64);
+        trackEdits_[2] = addEdit(kTrackWidth, 774, 296, 64);
+        trackEdits_[3] = addEdit(kTrackHeight, 846, 296, 64);
 
-        addLabel(L"The app only captures frames and never sends input to the target.", 18, 260, 560);
-        addLabel(L"Scroll down manually in small increments. A scrollbar/visual disagreement pauses the session.", 18, 286, 740);
-        status_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Select a target and capture a preview.",
-                                  WS_CHILD | WS_VISIBLE | SS_LEFT, 18, 330, 760, 75,
-                                  window_, menuId(kStatus), instance_, nullptr);
-        addLabel(L"Preview: drag inside a rectangle to move it; drag an edge to resize it.", 18, 400, 740);
+        statusCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
+                                      24, 376, 900, 112, window_, nullptr, instance_, nullptr);
+        addLabel(L"Session status", 42, 389, 160);
+        addLabel(L"The app only captures frames and never sends input to the target. Scroll down manually in small increments.",
+                 42, 414, 820);
+        status_ = CreateWindowExW(0, L"STATIC", L"Select a target and capture a preview.",
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                  42, 443, 864, 36, window_, menuId(kStatus), instance_, nullptr);
+        if (bodyFont_) SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+
+        previewCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
+                                       24, 500, 900, 220, window_, nullptr, instance_, nullptr);
+        addLabel(L"Preview & calibration", 42, 514, 220);
+        addLabel(L"Drag the green viewport or orange scrollbar rectangle to fine-tune it.", 300, 514, 560);
         previewCanvas_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"UniversalScrollStitcherPreview", nullptr,
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         18, 425, 760, 347, window_, nullptr, instance_, this);
+                                         36, 542, 876, 170, window_, nullptr, instance_, this);
 
+        loggingCheckbox_ = CreateWindowExW(0, L"BUTTON", L"Enable diagnostic logging",
+                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                           24, 740, 220, 28, window_, menuId(kLoggingEnable), instance_, nullptr);
+        if (bodyFont_) SendMessageW(loggingCheckbox_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        openLogsButton_ = addButton(L"Open logs folder", kOpenLogs, 252, 736, 150);
         latestReleaseLink_ = CreateWindowExW(
-            0, L"STATIC", L"Credits - Get the latest portable release from GitHub",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | SS_NOTIFY,
-            18, 812, 760, 22, window_, menuId(kLatestRelease), instance_, nullptr);
-        LOGFONTW fontDescription{};
-        const HFONT defaultFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        if (defaultFont && GetObjectW(defaultFont, sizeof(fontDescription), &fontDescription)) {
-            fontDescription.lfUnderline = TRUE;
-            latestReleaseFont_ = CreateFontIndirectW(&fontDescription);
-            if (latestReleaseFont_) {
-                SendMessageW(latestReleaseLink_, WM_SETFONT,
-                             reinterpret_cast<WPARAM>(latestReleaseFont_), TRUE);
-            }
+            0, L"STATIC", L"Get the latest portable release from GitHub",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | SS_NOTIFY | SS_RIGHT,
+            430, 740, 480, 28, window_, menuId(kLatestRelease), instance_, nullptr);
+        latestReleaseFont_ = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, TRUE, FALSE,
+                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        if (latestReleaseFont_) SendMessageW(latestReleaseLink_, WM_SETFONT,
+                                             reinterpret_cast<WPARAM>(latestReleaseFont_), TRUE);
+
+        RECT client{};
+        GetClientRect(window_, &client);
+        layoutControls(client.right - client.left, client.bottom - client.top);
+    }
+
+    void layoutControls(int clientWidth, int clientHeight) {
+        const int width = std::max(1, clientWidth);
+        const int margin = 24;
+        const int contentWidth = std::max(1, width - margin * 2);
+        const int footerTop = std::max(0, clientHeight - 52);
+        const int previewTop = 500;
+        const int previewHeight = std::max(170, footerTop - previewTop - 12);
+        const int buttonY = 184;
+        if (title_) MoveWindow(title_, margin, 20, contentWidth, 38, TRUE);
+        if (subtitle_) MoveWindow(subtitle_, margin, 58, contentWidth, 24, TRUE);
+        if (targetCard_) MoveWindow(targetCard_, margin, 96, contentWidth, 76, TRUE);
+        if (targetCombo_) MoveWindow(targetCombo_, 200, 112,
+                                     std::max(250, width - 340), 260, TRUE);
+        if (HWND refresh = GetDlgItem(window_, kRefresh)) MoveWindow(refresh,
+            width - margin - 100, 110, 100, 34, TRUE);
+        if (HWND preview = GetDlgItem(window_, kPreview)) MoveWindow(preview, margin, buttonY, 144, 34, TRUE);
+        if (HWND autoDetect = GetDlgItem(window_, kAutoDetect)) MoveWindow(autoDetect, 180, buttonY, 190, 34, TRUE);
+        if (HWND start = GetDlgItem(window_, kStart)) MoveWindow(start, 382, buttonY, 130, 34, TRUE);
+        if (HWND stop = GetDlgItem(window_, kStop)) MoveWindow(stop, 524, buttonY, 100, 34, TRUE);
+        if (HWND exportButton = GetDlgItem(window_, kExport)) MoveWindow(exportButton, 636, buttonY, 164, 34, TRUE);
+        if (calibrationCard_) MoveWindow(calibrationCard_, margin, 232, contentWidth, 130, TRUE);
+        if (statusCard_) MoveWindow(statusCard_, margin, 376, contentWidth, 112, TRUE);
+        if (status_) MoveWindow(status_, 42, 443, std::max(400, width - 84), 36, TRUE);
+        if (previewCard_) MoveWindow(previewCard_, margin, previewTop, contentWidth, previewHeight, TRUE);
+        if (previewCanvas_) MoveWindow(previewCanvas_, 36, previewTop + 42,
+                                       std::max(200, width - 72), std::max(100, previewHeight - 54), TRUE);
+        if (loggingCheckbox_) MoveWindow(loggingCheckbox_, margin, footerTop + 10, 220, 28, TRUE);
+        if (openLogsButton_) MoveWindow(openLogsButton_, 252, footerTop + 7, 150, 34, TRUE);
+        if (latestReleaseLink_) MoveWindow(latestReleaseLink_, std::max(420, width - 500),
+                                           footerTop + 10, std::min(476, width - 444), 28, TRUE);
+    }
+
+    LRESULT colorStatic(HWND control, HDC dc) const {
+        SetBkMode(dc, TRANSPARENT);
+        if (control == latestReleaseLink_) {
+            SetTextColor(dc, RGB(24, 96, 190));
+            return reinterpret_cast<LRESULT>(backgroundBrush_);
+        }
+        if (control == title_) {
+            SetTextColor(dc, RGB(20, 42, 74));
+            return reinterpret_cast<LRESULT>(backgroundBrush_);
+        }
+        if (control == subtitle_) {
+            SetTextColor(dc, RGB(84, 101, 122));
+            return reinterpret_cast<LRESULT>(backgroundBrush_);
+        }
+        if (control == status_) {
+            SetTextColor(dc, RGB(28, 62, 103));
+            SetBkMode(dc, OPAQUE);
+            return reinterpret_cast<LRESULT>(statusBrush_);
+        }
+        if (control == targetCard_ || control == calibrationCard_ || control == statusCard_ || control == previewCard_) {
+            SetBkMode(dc, OPAQUE);
+            return reinterpret_cast<LRESULT>(cardBrush_);
+        }
+        SetTextColor(dc, RGB(40, 54, 72));
+        return reinterpret_cast<LRESULT>(cardBrush_);
+    }
+
+    void drawButton(const DRAWITEMSTRUCT* item) const {
+        if (!item || item->CtlType != ODT_BUTTON) return;
+        const int id = static_cast<int>(item->CtlID);
+        const bool primary = id == kStart || id == kExport;
+        COLORREF fill = primary ? RGB(35, 108, 224) : RGB(235, 241, 249);
+        COLORREF text = primary ? RGB(255, 255, 255) : RGB(31, 56, 86);
+        if (item->itemState & ODS_DISABLED) {
+            fill = RGB(222, 227, 234);
+            text = RGB(136, 146, 160);
+        } else if (item->itemState & ODS_SELECTED) {
+            fill = primary ? RGB(24, 82, 180) : RGB(211, 222, 237);
+        }
+        RECT rect = item->rcItem;
+        InflateRect(&rect, -1, -1);
+        HBRUSH brush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, primary ? fill : RGB(199, 211, 228));
+        HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
+        HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+        RoundRect(item->hDC, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+        SelectObject(item->hDC, oldPen);
+        SelectObject(item->hDC, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+        SetBkMode(item->hDC, TRANSPARENT);
+        SetTextColor(item->hDC, text);
+        RECT textRect = rect;
+        wchar_t caption[128]{};
+        GetWindowTextW(item->hwndItem, caption, static_cast<int>(std::size(caption)));
+        DrawTextW(item->hDC, caption, -1, &textRect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        // Owner-drawn controls remain keyboard-accessible; make focus visible
+        // without changing their native tab behavior.
+        if (item->itemState & ODS_FOCUS) {
+            RECT focus = rect;
+            InflateRect(&focus, -4, -4);
+            DrawFocusRect(item->hDC, &focus);
         }
     }
 
+    static std::string narrow(const std::wstring& value) {
+        if (value.empty()) return {};
+        const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                                             nullptr, 0, nullptr, nullptr);
+        if (size <= 0) {
+            std::string fallback;
+            fallback.reserve(value.size());
+            for (const wchar_t character : value) {
+                fallback.push_back(character >= 0 && character <= 0x7f
+                    ? static_cast<char>(character) : '?');
+            }
+            return fallback;
+        }
+        std::string result(static_cast<std::size_t>(size), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                            result.data(), size, nullptr, nullptr);
+        return result;
+    }
+
+    static std::string rectDescription(const Rect& rect) {
+        return "x=" + std::to_string(rect.x) + " y=" + std::to_string(rect.y) +
+               " w=" + std::to_string(rect.width) + " h=" + std::to_string(rect.height);
+    }
+
+    static std::string windowDescription(HWND window) {
+        if (!IsWindow(window)) return "handle=0x0 title=<closed>";
+        wchar_t title[512]{};
+        GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+        std::ostringstream result;
+        result << "handle=0x" << std::hex << reinterpret_cast<std::uintptr_t>(window)
+               << " title=" << narrow(title);
+        return result.str();
+    }
+
+    void toggleLogging() {
+        const bool requested = SendMessageW(loggingCheckbox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (requested) {
+            if (!logger_.enable()) {
+                SendMessageW(loggingCheckbox_, BM_SETCHECK, BST_UNCHECKED, 0);
+                const std::string error = logger_.lastError();
+                setStatus(L"Diagnostic logging could not be enabled: " + widen(error));
+                return;
+            }
+            logger_.info("ui", "logging enable checkbox checked");
+            logger_.info("app", "startup diagnostics activated after UI initialization");
+            const std::wstring path = logger_.sessionPath().wstring();
+            setStatus(L"Diagnostic logging enabled. Session log: " + path);
+            return;
+        }
+        if (logger_.enabled()) logger_.info("ui", "logging enable checkbox unchecked");
+        logger_.disable();
+        setStatus(L"Diagnostic logging disabled. No capture pixels are stored.");
+    }
+
+    void openLogs() {
+        logger_.info("ui", "open logs folder button clicked");
+        if (!logger_.openLogsFolder()) {
+            setStatus(L"Could not open the logs folder: " + widen(logger_.lastError()));
+            return;
+        }
+        const std::wstring path = logger_.logsDirectory().wstring();
+        if (logger_.enabled()) setStatus(L"Logs folder opened. Active session log: " + logger_.sessionPath().wstring());
+        else setStatus(L"Logs folder opened: " + path);
+    }
+
     void refreshTargets() {
+        logger_.info("ui", "refresh targets requested");
         windows_.clear();
         std::pair<MainWindow*, std::vector<WindowInfo>*> context{this, &windows_};
         EnumWindows(&MainWindow::enumerateWindow, reinterpret_cast<LPARAM>(&context));
@@ -294,8 +548,10 @@ private:
             const LRESULT index = SendMessageW(targetCombo_, CB_ADDSTRING, 0,
                                                reinterpret_cast<LPARAM>(entry.title.c_str()));
             SendMessageW(targetCombo_, CB_SETITEMDATA, index, reinterpret_cast<LPARAM>(entry.handle));
+            logger_.info("target", "discovered " + windowDescription(entry.handle));
         }
         if (!windows_.empty()) SendMessageW(targetCombo_, CB_SETCURSEL, 0, 0);
+        logger_.info("target", "discovered window count=" + std::to_string(windows_.size()));
         setStatus(L"Select a target, then capture a preview to calibrate the viewport.");
     }
 
@@ -392,6 +648,11 @@ private:
     void selectScrollbarCandidate(std::size_t index, bool announce) {
         if (index >= scrollbarCandidates_.size()) return;
         selectedScrollbarCandidate_ = index;
+        const auto& candidate = scrollbarCandidates_[index];
+        logger_.info("calibration", "selected scrollbar candidate #" + std::to_string(index + 1) +
+                     " track{" + rectDescription(candidate.config.track) + "} thumb{" +
+                     rectDescription(candidate.observation.thumb) + "} confidence=" +
+                     std::to_string(candidate.observation.confidence));
         setRect(trackEdits_, scrollbarCandidates_[index].config.track);
         InvalidateRect(previewCanvas_, nullptr, FALSE);
         if (announce) {
@@ -567,6 +828,11 @@ private:
 
     void endPreviewDrag(HWND canvas) {
         if (GetCapture() == canvas) ReleaseCapture();
+        if (dragTarget_ == CanvasTarget::Viewport) {
+            logger_.info("calibration", "viewport drag finished with{" + rectDescription(readRect(viewportEdits_)) + "}");
+        } else if (dragTarget_ == CanvasTarget::Track) {
+            logger_.info("calibration", "scrollbar track drag finished with{" + rectDescription(readRect(trackEdits_)) + "}");
+        }
         dragTarget_ = CanvasTarget::None;
         dragEdges_ = EdgeNone;
         InvalidateRect(canvas, nullptr, FALSE);
@@ -603,27 +869,38 @@ private:
     bool ensureSource() {
         target_ = selectedTarget();
         if (!IsWindow(target_)) {
+            logger_.warning("target", "selected target is no longer a valid window");
             setStatus(L"Choose a valid visible top-level window first.");
             return false;
         }
+        logger_.info("target", "using " + windowDescription(target_));
         if (!source_ || source_->width() == 0 || sourceTarget_ != target_) {
+            logger_.info("capture", "initializing frame source for " + windowDescription(target_));
             source_ = createFrameSource(target_);
             sourceTarget_ = target_;
         }
         if (!source_) {
+            logger_.error("capture", "frame source initialization failed; graphics capture and GDI fallback unavailable");
             setStatus(L"Unable to initialize Windows Graphics Capture or visible-window fallback.");
             return false;
         }
+        const std::wstring sourceName = source_->name();
+        logger_.info("capture", "frame source ready name=" + narrow(sourceName) +
+                     (sourceName.find(L"GDI") != std::wstring::npos ? " (fallback)" : "") +
+                     " dimensions=" + std::to_string(source_->width()) + "x" + std::to_string(source_->height()));
         return true;
     }
 
     void capturePreview() {
+        logger_.info("preview", "preview capture requested");
         if (capturing_) {
+            logger_.warning("preview", "preview rejected while capture is active");
             setStatus(L"Stop the current capture before recapturing a preview.");
             return;
         }
         target_ = selectedTarget();
         if (!IsWindow(target_)) {
+            logger_.warning("preview", "preview rejected because target is invalid");
             setStatus(L"Choose a valid visible top-level window first.");
             return;
         }
@@ -638,24 +915,57 @@ private:
         source_ = createFrameSource(target_);
         sourceTarget_ = target_;
         if (!source_) {
+            logger_.error("preview", "unable to initialize frame source for " + windowDescription(target_));
             setStatus(L"Unable to capture the selected window.");
             return;
         }
+        const std::wstring previewSourceName = source_->name();
+        logger_.info("capture", "preview frame source ready name=" + narrow(previewSourceName) +
+                     (previewSourceName.find(L"GDI") != std::wstring::npos ? " (fallback)" : "") +
+                     " dimensions=" + std::to_string(source_->width()) + "x" + std::to_string(source_->height()));
         cv::Mat captured;
         for (int attempt = 0; attempt < 8 && captured.empty(); ++attempt) {
+            logger_.info("preview", "preview frame attempt=" + std::to_string(attempt + 1));
             const auto frame = source_->capture();
             if (frame) captured = frame->bgra.clone();
             Sleep(20);
         }
         if (captured.empty()) {
+            logger_.warning("preview", "preview capture returned no frame after 8 attempts");
             setStatus(L"The capture source did not return a frame yet; try Capture preview again.");
             return;
         }
         preview_ = std::move(captured);
-        setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
+        logger_.info("preview", "preview succeeded source=" + narrow(source_->name()) +
+                     " dimensions=" + std::to_string(preview_.cols) + "x" + std::to_string(preview_.rows));
         scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
-        if (!scrollbarCandidates_.empty()) selectScrollbarCandidate(0, false);
-        else setRect(trackEdits_, {std::max(0, preview_.cols - 18), 0, 18, preview_.rows});
+        logger_.info("calibration", "auto-detected scrollbar candidates=" +
+                     std::to_string(scrollbarCandidates_.size()));
+        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
+            const auto& candidate = scrollbarCandidates_[index];
+            logger_.info("calibration", "candidate #" + std::to_string(index + 1) +
+                         " track{" + rectDescription(candidate.config.track) + "} thumb{" +
+                         rectDescription(candidate.observation.thumb) + "} confidence=" +
+                         std::to_string(candidate.observation.confidence));
+        }
+        if (!scrollbarCandidates_.empty()) {
+            selectScrollbarCandidate(0, false);
+            // The content viewport must exclude the scrollbar strip; baking
+            // the thumb into every strip leaves a jumping column through the
+            // entire capture.
+            Rect viewport{0, 0, preview_.cols, preview_.rows};
+            const Rect& track = scrollbarCandidates_.front().config.track;
+            if (track.x + track.width / 2 >= preview_.cols / 2) {
+                viewport.width = std::max(16, track.x);
+            } else {
+                viewport.x = std::min(preview_.cols - 16, track.right());
+                viewport.width = std::max(16, preview_.cols - viewport.x);
+            }
+            setRect(viewportEdits_, viewport);
+        } else {
+            setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
+            setRect(trackEdits_, {std::max(0, preview_.cols - 18), 0, 18, preview_.rows});
+        }
         std::wstring message = L"Preview captured by " + source_->name() + L" (" +
             std::to_wstring(preview_.cols) + L"x" + std::to_wstring(preview_.rows) + L"). ";
         if (!scrollbarCandidates_.empty()) {
@@ -669,14 +979,24 @@ private:
     }
 
     void autoDetectScrollbar() {
+        logger_.info("calibration", "auto-detect scrollbar requested");
         if (preview_.empty()) capturePreview();
         if (preview_.empty()) return;
         scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
+        logger_.info("calibration", "auto-detect completed candidates=" + std::to_string(scrollbarCandidates_.size()));
         selectedScrollbarCandidate_.reset();
         if (scrollbarCandidates_.empty()) {
+            logger_.warning("calibration", "auto-detect found no scrollbar candidate");
             setStatus(L"No scrollbar candidate was found. Set the track rectangle manually.");
             InvalidateRect(previewCanvas_, nullptr, FALSE);
             return;
+        }
+        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
+            const auto& candidate = scrollbarCandidates_[index];
+            logger_.info("calibration", "candidate #" + std::to_string(index + 1) +
+                         " track{" + rectDescription(candidate.config.track) + "} thumb{" +
+                         rectDescription(candidate.observation.thumb) + "} confidence=" +
+                         std::to_string(candidate.observation.confidence));
         }
         selectScrollbarCandidate(0, false);
         setStatus(std::to_wstring(scrollbarCandidates_.size()) +
@@ -685,6 +1005,7 @@ private:
     }
 
     void startCapture() {
+        logger_.info("capture", "start requested");
         if (capturing_) return;
         if (preview_.empty() || selectedTarget() != sourceTarget_) capturePreview();
         if (!ensureSource()) return;
@@ -692,11 +1013,15 @@ private:
         const int calibratedHeight = preview_.rows;
         const auto frame = source_->capture();
         if (!frame) {
+            logger_.error("capture", "first frame unavailable");
             setStatus(L"Could not obtain the first frame; capture a preview again.");
             return;
         }
         if ((calibratedWidth > 0 && frame->width() != calibratedWidth) ||
             (calibratedHeight > 0 && frame->height() != calibratedHeight)) {
+            logger_.warning("capture", "target resized before start from=" + std::to_string(calibratedWidth) +
+                            "x" + std::to_string(calibratedHeight) + " to=" +
+                            std::to_string(frame->width()) + "x" + std::to_string(frame->height()));
             preview_ = frame->bgra.clone();
             InvalidateRect(previewCanvas_, nullptr, TRUE);
             session_.reset();
@@ -709,75 +1034,138 @@ private:
         options.viewport = readRect(viewportEdits_);
         options.scrollbar.track = readRect(trackEdits_);
         options.scrollbar.enabled = true;
+        logger_.info("capture", "start options viewport{" + rectDescription(options.viewport) +
+                     "} scrollbar{" + rectDescription(options.scrollbar.track) + "} preview=" +
+                     std::to_string(preview_.cols) + "x" + std::to_string(preview_.rows));
         if (!options.viewport.valid() || !options.scrollbar.track.valid()) {
+            logger_.error("capture", "start rejected because calibration rectangle is invalid");
             setStatus(L"Viewport and scrollbar track must have positive width and height.");
             return;
         }
         if (!session_.start(preview_, options)) {
+            logger_.error("capture", "stitch session start failed: " + session_.lastMessage());
             setStatus(widen(session_.lastMessage()));
             return;
         }
         capturing_ = true;
+        captureTickCount_ = 0;
+        transientMissCount_ = 0;
+        logger_.info("capture", "capture started");
         SetTimer(window_, kTimer, kTimerPeriodMs, nullptr);
-        setStatus(L"Capturing. Scroll the target down manually; no input is injected.");
+        setStatus(L"Capturing. Scroll the target down manually; no input is injected. "
+                  L"Prefer small mouse-wheel notches or the down arrow.");
     }
 
     void stopCapture() {
+        logger_.info("capture", "stop requested capturing=" + std::to_string(capturing_ ? 1 : 0));
         if (!capturing_ && session_.state() != SessionState::Paused &&
             session_.state() != SessionState::Capturing) return;
         capturing_ = false;
         KillTimer(window_, kTimer);
         if (session_.finish()) {
+            logger_.info("capture", "capture finalized accepted_frames=" + std::to_string(session_.acceptedFrames()) +
+                         " output_rows=" + std::to_string(session_.outputRows()));
             setStatus(L"Finalized " + std::to_wstring(session_.outputStore().width()) + L"x" +
                       std::to_wstring(session_.outputStore().rows()) +
                       L" in disk-backed storage. Choose Export PNG/JPEG.");
         } else {
+            logger_.error("capture", "capture finalize failed: " + session_.lastMessage());
             setStatus(widen(session_.lastMessage()));
         }
     }
 
     void captureTick() {
         if (!capturing_ || !source_) return;
-        const auto frame = source_->capture();
-        if (!frame) {
+        ++captureTickCount_;
+
+        bool sawFrame = false;
+        StitchUpdate lastUpdate;
+        // Windows Graphics Capture exposes a real queue worth draining. The
+        // GDI fallback synthesizes a fresh full-window capture on every call,
+        // so invoking it repeatedly here only burns CPU on duplicate frames.
+        const int maximumFrames = dynamic_cast<GraphicsCaptureSource*>(source_.get())
+            ? kMaximumFramesPerTick : 1;
+        for (int drained = 0; drained < maximumFrames; ++drained) {
+            const auto frame = source_->capture();
+            if (!frame) break;
+            sawFrame = true;
+            if (frame->width() != preview_.cols || frame->height() != preview_.rows) {
+                capturing_ = false;
+                KillTimer(window_, kTimer);
+                setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
+                logger_.warning("capture", "capture frame dimensions changed from=" + std::to_string(preview_.cols) +
+                                "x" + std::to_string(preview_.rows) + " to=" + std::to_string(frame->width()) +
+                                "x" + std::to_string(frame->height()));
+                return;
+            }
+
+            lastUpdate = session_.process(frame->bgra);
+            if (lastUpdate.accepted || lastUpdate.rejected || lastUpdate.paused) {
+                logger_.info("stitch", "update accepted=" + std::to_string(lastUpdate.accepted ? 1 : 0) +
+                             " rejected=" + std::to_string(lastUpdate.rejected ? 1 : 0) +
+                             " paused=" + std::to_string(lastUpdate.paused ? 1 : 0) +
+                             " top=" + std::to_string(lastUpdate.atTop ? 1 : 0) +
+                             " bottom=" + std::to_string(lastUpdate.atBottom ? 1 : 0) +
+                             " scrollbar_visible=" + std::to_string(lastUpdate.scrollbarVisible ? 1 : 0) +
+                             " shift=" + std::to_string(lastUpdate.shift) +
+                             " expected_shift=" + std::to_string(lastUpdate.expectedShift) +
+                             " consecutive_rejections=" + std::to_string(lastUpdate.consecutiveRejections) +
+                             " visual_confidence=" + std::to_string(lastUpdate.confidence) +
+                             " scrollbar_confidence=" + std::to_string(lastUpdate.scrollbarConfidence) +
+                             " message=" + lastUpdate.message);
+            }
+            if (lastUpdate.paused) {
+                capturing_ = false;
+                KillTimer(window_, kTimer);
+                setStatus(std::wstring(L"PAUSED: ") + widen(lastUpdate.message));
+                return;
+            }
+        }
+
+        if (!sawFrame) {
+            ++transientMissCount_;
+            if (transientMissCount_ <= 3 || transientMissCount_ % 25 == 0) {
+                logger_.warning("capture", "transient frame miss tick=" + std::to_string(captureTickCount_) +
+                                " count=" + std::to_string(transientMissCount_));
+            }
             if (!IsWindow(target_)) {
                 capturing_ = false;
                 KillTimer(window_, kTimer);
                 setStatus(L"The target window closed; click Stop to finalize the valid prefix.");
+                logger_.error("capture", "target window closed during capture");
             } else if (source_->width() != preview_.cols || source_->height() != preview_.rows) {
                 capturing_ = false;
                 KillTimer(window_, kTimer);
                 setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
+                logger_.warning("capture", "target resized or source dimensions changed during capture");
             }
             // Windows Graphics Capture can have an empty frame queue between
             // compositor updates. Treat that as a transient miss, not a
             // failed capture.
             return;
         }
-        if (frame->width() != preview_.cols || frame->height() != preview_.rows) {
-            capturing_ = false;
-            KillTimer(window_, kTimer);
-            setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
-            return;
-        }
-        const StitchUpdate update = session_.process(frame->bgra);
-        if (update.paused) {
-            capturing_ = false;
-            KillTimer(window_, kTimer);
-            setStatus(std::wstring(L"PAUSED: ") + widen(update.message));
-            return;
-        }
-        if (update.accepted) {
-            std::wstring message = widen(update.message) +
-                L" (shift " + std::to_wstring(update.shift) + L", confidence " +
-                std::to_wstring(update.confidence).substr(0, 5) + L")";
+
+        transientMissCount_ = 0;
+        if (lastUpdate.accepted) {
+            std::wstring message = widen(lastUpdate.message) +
+                L" (shift " + std::to_wstring(lastUpdate.shift) + L", confidence " +
+                std::to_wstring(lastUpdate.confidence).substr(0, 5) + L")";
             setStatus(message);
+            return;
+        }
+        // The session is still live and still holding the last accepted frame,
+        // so the capture keeps running while the user recovers the overlap.
+        if (lastUpdate.rejected) {
+            setStatus(L"RECOVERING: " + widen(lastUpdate.message) +
+                      L" (mouse wheel may be jumping too far — try slower notches or the down arrow)");
         }
     }
 
     void exportImage() {
+        logger_.info("export", "export requested");
         if (capturing_) stopCapture();
         if (!session_.hasOutput()) {
+            logger_.warning("export", "export rejected because no finalized output exists");
             setStatus(L"Capture and stop a session before exporting.");
             return;
         }
@@ -789,7 +1177,10 @@ private:
         dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
         dialog.lpstrDefExt = L"png";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileNameW(&dialog)) return;
+        if (!GetSaveFileNameW(&dialog)) {
+            logger_.info("export", "export dialog cancelled");
+            return;
+        }
         std::filesystem::path outputPath(filename);
         const std::wstring extension = outputPath.extension().wstring();
         const bool png = dialog.nFilterIndex != 2;
@@ -804,7 +1195,11 @@ private:
             }
         }
         const ExportResult result = ImageExporter::write(session_.outputStore(), outputPath);
+        logger_.info("export", "export path requested=" + narrow(outputPath.wstring()) +
+                     " success=" + std::to_string(result.success ? 1 : 0) +
+                     " files=" + std::to_string(result.files.size()));
         if (!result.success) {
+            logger_.error("export", "export failed: " + result.message);
             setStatus(widen(result.message));
             return;
         }
@@ -819,12 +1214,20 @@ private:
         case kStart: startCapture(); break;
         case kStop: stopCapture(); break;
         case kExport: exportImage(); break;
+        case kLoggingEnable: toggleLogging(); break;
+        case kOpenLogs: openLogs(); break;
         default: break;
         }
     }
 
     void setStatus(const std::wstring& text) {
-        if (status_) SetWindowTextW(status_, text.c_str());
+        std::wstring visibleText = text;
+        const std::string loggingError = logger_.lastError();
+        if (!loggingError.empty()) {
+            visibleText += L"\nLogging warning: " + widen(loggingError);
+        }
+        if (status_) SetWindowTextW(status_, visibleText.c_str());
+        logger_.info("status", narrow(text));
     }
 };
 

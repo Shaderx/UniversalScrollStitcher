@@ -37,17 +37,19 @@ bool StitchSession::start(const cv::Mat& firstFrame, const StitchOptions& option
         scrollbar_.confidence = initial.confidence;
         scrollbar_.atTop = scrollbar_.top <= scrollbar_.trackTop + 2;
         scrollbar_.atBottom = initial.thumbBottom() >= scrollbar_.trackBottom - 2;
-        if (!scrollbar_.atTop) {
-            state_ = SessionState::Failed;
-            lastMessage_ = "return the target to the top before starting a full capture";
-            store_.close(true);
-            pending_.release();
-            return false;
-        }
     }
     state_ = SessionState::Capturing;
-    lastMessage_ = initial.detected ? "capturing; scroll down manually" :
-                                     "capturing; waiting for scrollbar detection";
+    if (!initial.detected) {
+        lastMessage_ = "capturing; waiting for scrollbar detection";
+    } else if (scrollbar_.atTop) {
+        lastMessage_ = "capturing; scroll down manually";
+    } else {
+        // Starting mid-document is a legitimate request, and the track
+        // rectangle may simply not line up with the real track. Report it
+        // instead of refusing to capture.
+        lastMessage_ = "capturing from the current position; the target does not appear "
+                       "to be scrolled to the top";
+    }
     return true;
 }
 
@@ -69,13 +71,27 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
 
     const ScrollbarObservation observation = ScrollbarDetector::detect(frame, options_.scrollbar);
     update.scrollbarConfidence = observation.confidence;
+    update.scrollbarVisible = observation.detected;
     if (!observation.detected) {
-        state_ = SessionState::Paused;
-        lastMessage_ = "scrollbar not detected; adjust the track rectangle and start again";
-        update.paused = true;
-        update.message = lastMessage_;
+        // Overlay scrollbars fade out while the pointer is idle. Hold the
+        // pending frame and keep waiting; the thumb reappears on the next
+        // scroll and the delta is still measured from the accepted baseline.
+        // Once a thumb has been seen, its disappearance must not time out a
+        // valid manual capture just because the user pauses to read.
+        ++consecutiveScrollbarMisses_;
+        if (!scrollbar_.valid &&
+            consecutiveScrollbarMisses_ > kInitialScrollbarMissPauseThreshold) {
+            state_ = SessionState::Paused;
+            lastMessage_ = "scrollbar not detected; adjust the track rectangle and start again";
+            update.paused = true;
+            update.message = lastMessage_;
+            return update;
+        }
+        update.message = "scrollbar not visible; waiting for it to reappear";
+        lastMessage_ = update.message;
         return update;
     }
+    consecutiveScrollbarMisses_ = 0;
 
     if (!scrollbar_.valid) {
         scrollbar_.valid = true;
@@ -93,16 +109,19 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
     const int thumbDelta = observation.thumbTop() - scrollbar_.top;
     update.atTop = observation.thumbTop() <= options_.scrollbar.track.y + 2;
     update.atBottom = observation.thumbBottom() >= options_.scrollbar.track.bottom() - 2;
-    if (thumbDelta == 0) {
-        update.message = "waiting for manual scroll";
-        lastMessage_ = update.message;
-        return update;
-    }
-    if (thumbDelta < 0) {
+    if (thumbDelta < -kThumbNoiseTolerance) {
         state_ = SessionState::Paused;
         lastMessage_ = "upward scrolling is not supported; start again at the top";
         update.paused = true;
         update.message = lastMessage_;
+        return update;
+    }
+    if (thumbDelta <= 0) {
+        // Sub-pixel thumb rendering and hover animations move the measured
+        // top by a pixel on a stationary view. Treat that as no movement
+        // rather than as a reversal.
+        update.message = "waiting for manual scroll";
+        lastMessage_ = update.message;
         return update;
     }
 
@@ -118,22 +137,39 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
         pending_, current, expected, options_.estimator);
     update.shift = estimate.shift;
     update.confidence = estimate.confidence;
-    if (!estimate.accepted) {
-        state_ = SessionState::Paused;
-        lastMessage_ = "scrollbar moved but visual overlap was rejected: " + estimate.reason;
-        update.paused = true;
+
+    // A rejected frame is not a failed session. The pending frame and the
+    // accepted scrollbar baseline are both left untouched, so the overlap
+    // returns as soon as the view comes back within range and the capture
+    // continues with no gap. Only a sustained failure escalates to Paused.
+    auto reject = [&](const std::string& reason) {
+        ++consecutiveRejections_;
+        update.rejected = true;
+        update.consecutiveRejections = consecutiveRejections_;
+        if (consecutiveRejections_ >= kRejectionPauseThreshold) {
+            state_ = SessionState::Paused;
+            update.paused = true;
+            lastMessage_ = "visual overlap was lost and did not recover: " + reason;
+        } else {
+            lastMessage_ = "lost visual overlap (" + reason + "); scroll back up slightly to recover";
+        }
         update.message = lastMessage_;
         return update;
+    };
+
+    if (estimate.duplicate) {
+        // The thumb moved but the content did not, which happens while a
+        // scrollbar animates or a view rubber-bands. Nothing to stitch.
+        update.message = "waiting for manual scroll";
+        lastMessage_ = update.message;
+        return update;
     }
+    if (!estimate.accepted) return reject(estimate.reason);
 
     const Seam seam = SeamFinder::find(pending_, current, estimate.shift);
     const int commitEnd = estimate.shift + seam.currentRow;
     if (!seam.valid || commitEnd <= pendingStart_ || commitEnd > pending_.rows) {
-        state_ = SessionState::Paused;
-        lastMessage_ = "visual seam made no forward progress; scroll more slowly and start again";
-        update.paused = true;
-        update.message = lastMessage_;
-        return update;
+        return reject("the seam made no forward progress");
     }
     if (!store_.append(pending_, pendingStart_, commitEnd)) {
         state_ = SessionState::Failed;
@@ -158,6 +194,7 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
             : scrollbar_.learnedContentPerThumbPixel * 0.75F + observedScale * 0.25F;
     }
     ++acceptedFrames_;
+    consecutiveRejections_ = 0;
     update.accepted = true;
     lastMessage_ = update.atBottom ? "bottom detected; stop to finalize" : "stitched; continue scrolling down";
     update.message = lastMessage_;
@@ -201,6 +238,8 @@ void StitchSession::reset() {
     pendingStart_ = 0;
     acceptedFrames_ = 0;
     outputRows_ = 0;
+    consecutiveRejections_ = 0;
+    consecutiveScrollbarMisses_ = 0;
     state_ = SessionState::Idle;
     lastMessage_.clear();
 }

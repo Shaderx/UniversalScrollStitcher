@@ -17,7 +17,17 @@ namespace universal_stitcher {
 namespace {
 
 using Microsoft::WRL::ComPtr;
-constexpr std::uint64_t kSafeMaxRows = 65000ULL;
+
+// JPEG cannot describe more than 65,535 rows, and some Windows codec versions
+// reject the last few, so keep a margin. PNG has no comparable limit; splitting
+// it too would defeat the point of a single continuous capture. The PNG value
+// is only a sanity bound against a runaway session.
+constexpr std::uint64_t kSafeMaxJpegRows = 65000ULL;
+constexpr std::uint64_t kSafeMaxPngRows = 500000ULL;
+
+constexpr std::uint64_t maxRowsFor(bool jpeg) noexcept {
+    return jpeg ? kSafeMaxJpegRows : kSafeMaxPngRows;
+}
 
 std::wstring lowerExtension(const std::filesystem::path& path) {
     std::wstring extension = path.extension().wstring();
@@ -211,7 +221,7 @@ ExportResult ImageExporter::write(const cv::Mat& bgra, const std::filesystem::pa
             : "PNG width exceeds the WIC 65,535-pixel format limit";
         return result;
     }
-    if (static_cast<std::uint64_t>(bgra.rows) <= kSafeMaxRows) {
+    if (static_cast<std::uint64_t>(bgra.rows) <= maxRowsFor(jpeg)) {
         std::string error;
         if (!writeOne(bgra, requestedPath, options.jpegQuality, error)) {
             std::error_code ignored;
@@ -225,7 +235,7 @@ ExportResult ImageExporter::write(const cv::Mat& bgra, const std::filesystem::pa
         return result;
     }
 
-    const int maxRows = 65535;
+    const int maxRows = static_cast<int>(maxRowsFor(jpeg));
     const int partCount = (bgra.rows + maxRows - 1) / maxRows;
     for (int part = 0; part < partCount; ++part) {
         const int top = part * maxRows;
@@ -270,11 +280,7 @@ ExportResult ImageExporter::write(const StripStore& store,
             : "PNG width exceeds the WIC 65,535-pixel format limit";
         return result;
     }
-    // WIC's built-in codecs reject dimensions at the edge of the nominal
-    // 65,535-pixel limit on some Windows codec versions (notably JPEG). Keep
-    // a small safety margin and stream both formats in numbered vertical
-    // parts when necessary.
-    const std::uint64_t maxRows = kSafeMaxRows;
+    const std::uint64_t maxRows = maxRowsFor(jpeg);
     const std::uint64_t partCount = (store.rows() + maxRows - 1) / maxRows;
     for (std::uint64_t part = 0; part < partCount; ++part) {
         const std::uint64_t firstRow = part * maxRows;

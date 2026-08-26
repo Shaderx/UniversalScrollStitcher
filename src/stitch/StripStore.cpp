@@ -59,6 +59,10 @@ bool StripStore::append(const cv::Mat& bgra, int firstRow, int lastRow) {
     for (int row = firstRow; row < lastRow; ++row) {
         output.write(reinterpret_cast<const char*>(bgra.ptr(row)), static_cast<std::streamsize>(rowBytes));
     }
+    // Writes land in the stream buffer, so a full disk surfaces at flush time.
+    // Without this the destructor would swallow the error and the store would
+    // report rows it never actually persisted.
+    output.flush();
     if (!output) return false;
     rowCount_ += rowCount;
     return true;

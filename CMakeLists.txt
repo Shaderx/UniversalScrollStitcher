@@ -59,13 +59,21 @@ if (WIN32)
     target_link_libraries(stitch_export PUBLIC stitch_core windowscodecs ole32)
     target_compile_definitions(stitch_export PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 
+    add_library(diagnostic_logger STATIC
+        src/DiagnosticLogger.cpp
+    )
+    target_include_directories(diagnostic_logger PUBLIC include)
+    target_link_libraries(diagnostic_logger PUBLIC shell32)
+    target_compile_definitions(diagnostic_logger PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_features(diagnostic_logger PUBLIC cxx_std_20)
+
     add_executable(UniversalScrollStitcher WIN32
         src/main.cpp
         src/capture/WindowCapture.cpp
         src/capture/GraphicsCaptureSource.cpp
     )
     target_include_directories(UniversalScrollStitcher PRIVATE include)
-    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export user32 gdi32 shcore dwmapi comdlg32 shell32)
+    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export diagnostic_logger user32 gdi32 shcore dwmapi comdlg32 shell32)
     target_compile_definitions(UniversalScrollStitcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     copy_opencv_runtime(UniversalScrollStitcher)
 
@@ -110,13 +118,17 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
     target_include_directories(stitch_core_tests PRIVATE include)
     add_test(NAME stitch_core_tests COMMAND stitch_core_tests)
     if (WIN32)
+        add_executable(stitch_logger_tests tests/logger_tests.cpp)
+        target_link_libraries(stitch_logger_tests PRIVATE diagnostic_logger)
+        target_include_directories(stitch_logger_tests PRIVATE include)
+        add_test(NAME stitch_logger_tests COMMAND stitch_logger_tests)
         add_executable(stitch_export_tests tests/export_tests.cpp)
         target_link_libraries(stitch_export_tests PRIVATE stitch_export)
         target_include_directories(stitch_export_tests PRIVATE include)
         add_test(NAME stitch_export_tests COMMAND stitch_export_tests)
         copy_opencv_runtime(stitch_core_tests)
         copy_opencv_runtime(stitch_export_tests)
-        set_tests_properties(stitch_core_tests stitch_export_tests
+        set_tests_properties(stitch_core_tests stitch_logger_tests stitch_export_tests
             PROPERTIES RUN_SERIAL TRUE)
     endif()
 endif()

@@ -15,6 +15,11 @@ struct RunResult {
     int top = 0;
     int bottom = 0;
     float confidence = 0.0F;
+    // The vertical extent of the scrollbar track itself, which is usually a
+    // subrange of the searched strip. Window chrome above and below the track
+    // deviates from the track baseline and bounds the expansion.
+    int trackTop = 0;
+    int trackBottom = 0;
 };
 
 float luma(const cv::Vec4b& pixel) {
@@ -72,6 +77,8 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
     const int minimumRun = std::max(4, std::min(24, track.height / 100));
 
     RunResult best;
+    int bestLocalTop = -1;
+    int bestLocalBottom = -1;
     int runStart = -1;
     for (int i = 0; i <= track.height; ++i) {
         const bool active = i < track.height && deviations[static_cast<std::size_t>(i)] >= threshold;
@@ -90,12 +97,39 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
                 const float compactness = 1.0F - std::fabs(static_cast<float>(length) - track.height * 0.12F) / std::max(1.0F, track.height * 0.88F);
                 const float score = peak * (0.65F + 0.35F * std::max(0.0F, compactness));
                 if (score > best.confidence) {
-                    best = {completedStart + track.y, runEnd + track.y,
-                            std::clamp(score / 64.0F, 0.0F, 1.0F)};
+                    best.top = completedStart + track.y;
+                    best.bottom = runEnd + track.y;
+                    best.confidence = std::clamp(score / 64.0F, 0.0F, 1.0F);
+                    bestLocalTop = completedStart;
+                    bestLocalBottom = runEnd;
                 }
             }
         }
     }
+    if (bestLocalTop < 0) return {};
+
+    // Grow away from the thumb across rows that still match the track
+    // baseline. Window chrome above or below the track (title bars, tool
+    // strips, status bars) deviates from that baseline and stops the growth,
+    // which yields the real track bounds instead of the whole searched strip.
+    int extentTop = bestLocalTop;
+    int extentBottom = bestLocalBottom;
+    while (extentTop > 0 && deviations[static_cast<std::size_t>(extentTop - 1)] < threshold) --extentTop;
+    while (extentBottom < track.height &&
+           deviations[static_cast<std::size_t>(extentBottom)] < threshold) ++extentBottom;
+
+    // A track must be able to hold the thumb with room to travel. Anything
+    // smaller is more likely a misread than a genuine bound, so fall back to
+    // the searched strip rather than inventing a tight, wrong track.
+    const int extentHeight = extentBottom - extentTop;
+    const int thumbHeight = bestLocalBottom - bestLocalTop;
+    if (extentHeight < std::max(minimumRun * 2, thumbHeight + 2)) {
+        best.trackTop = track.y;
+        best.trackBottom = track.bottom();
+        return best;
+    }
+    best.trackTop = extentTop + track.y;
+    best.trackBottom = extentBottom + track.y;
     return best;
 }
 
@@ -116,9 +150,15 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
 
     auto collect = [&](int firstX, int lastX, ScrollbarSide side) {
         for (int x = firstX; x <= lastX; ++x) {
-            const Rect track{x, 0, candidateWidth, bgra.rows};
-            const RunResult run = findRun(bgra, track);
+            const Rect strip{x, 0, candidateWidth, bgra.rows};
+            const RunResult run = findRun(bgra, strip);
             if (run.confidence < 0.18F || run.bottom <= run.top) continue;
+            // Publish the measured track extent, not the full-height search
+            // strip. StitchSession derives top-of-document and end-of-document
+            // state from track.y and track.bottom(), so a strip that spans the
+            // title bar makes a document that is at the top look scrolled.
+            const Rect track{strip.x, run.trackTop, strip.width, run.trackBottom - run.trackTop};
+            if (!track.valid()) continue;
             candidates.push_back({
                 {track, side, true},
                 {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence}});

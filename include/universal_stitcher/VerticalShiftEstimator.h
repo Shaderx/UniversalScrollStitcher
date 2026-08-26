@@ -20,9 +20,13 @@ struct ShiftEstimate {
 struct ShiftEstimatorOptions {
     float minimumConfidence = 0.78F;
     float minimumMargin = 0.012F;
-    float priorToleranceRatio = 0.75F;
-    int minimumPriorTolerance = 18;
-    float minimumOverlapRatio = 0.25F;
+    // Keep the scrollbar prior fairly tight so repeating UI chrome cannot
+    // invent a distant false lock, then fall back to a stricter broad search
+    // when the prior window finds nothing usable (typical of a fast wheel notch).
+    float priorToleranceRatio = 1.0F;
+    int minimumPriorTolerance = 32;
+    // Allow stitching when only a thinner band still overlaps between samples.
+    float minimumOverlapRatio = 0.15F;
 };
 
 // Estimates the amount by which current content moved downward relative to
