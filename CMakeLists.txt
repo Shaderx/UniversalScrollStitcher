@@ -65,7 +65,7 @@ if (WIN32)
         src/capture/GraphicsCaptureSource.cpp
     )
     target_include_directories(UniversalScrollStitcher PRIVATE include)
-    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export user32 gdi32 shcore dwmapi comdlg32)
+    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export user32 gdi32 shcore dwmapi comdlg32 shell32)
     target_compile_definitions(UniversalScrollStitcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     copy_opencv_runtime(UniversalScrollStitcher)
 
@@ -84,6 +84,21 @@ if (WIN32)
             message(WARNING "C++/WinRT headers not found; using the visible-window GDI capture fallback.")
         endif()
     endif()
+
+    install(TARGETS UniversalScrollStitcher RUNTIME DESTINATION .)
+    if (UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS)
+        install(FILES ${UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS} DESTINATION .)
+    endif()
+    install(FILES README.md DESTINATION .)
+    foreach(dependency IN ITEMS cppwinrt libjpeg-turbo libpng opencv4 zlib)
+        set(dependency_notice
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/${dependency}/copyright")
+        if (EXISTS "${dependency_notice}")
+            install(FILES "${dependency_notice}"
+                    DESTINATION licenses
+                    RENAME "${dependency}.txt")
+        endif()
+    endforeach()
 else()
     message(STATUS "The GUI capture target is Windows-only; building stitch_core and tests.")
 endif()

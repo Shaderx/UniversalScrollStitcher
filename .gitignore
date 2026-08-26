@@ -3,6 +3,8 @@
 /build_*/
 /out/
 /vcpkg_installed/
+/release-candidate/
+/*.zip
 /.vs/
 *.suo
 *.user

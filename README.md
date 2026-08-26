@@ -1,43 +1,72 @@
 # Universal Scroll Stitcher
 
-Universal Scroll Stitcher is a small Windows desktop utility for making one long screenshot while the user manually scrolls a window. It is intentionally content-agnostic: there are no game templates, OCR rules, process hooks, simulated wheel events, or input injection.
+[![Build portable Windows release](https://github.com/Shaderx/UniversalScrollStitcher/actions/workflows/build.yml/badge.svg)](https://github.com/Shaderx/UniversalScrollStitcher/actions/workflows/build.yml)
 
-The stitcher uses a hybrid signal:
+Universal Scroll Stitcher is a lightweight Windows desktop utility that turns a manually scrolled window into one continuous PNG or JPEG. It is content-agnostic: there are no templates, OCR rules, process hooks, simulated wheel events, or input injection.
 
-* the scrollbar thumb establishes whether the view moved, the scroll direction, top/bottom state, and a displacement prior;
-* frame-to-frame pixel registration finds the exact vertical displacement and rejects ambiguous matches;
-* a low-difference row inside the overlap is selected as the seam;
-* accepted strips are written to a temporary disk-backed store so intermediate full screenshots do not accumulate in RAM.
+## Download
 
-## Build
+Download the latest `UniversalScrollStitcher-windows-x64.zip` from [GitHub Releases](https://github.com/Shaderx/UniversalScrollStitcher/releases/latest), extract it anywhere, and run `UniversalScrollStitcher.exe`. The release is portable and requires no installer or separately installed OpenCV/Visual C++ runtime. Third-party license notices are included in the package.
 
-The supported build is Visual Studio 2022 (v143) with a Windows 10/11 SDK and CMake 3.24 or newer:
+Windows 10 or 11 x64 is required. Some protected or hardware-overlay surfaces cannot be captured by Windows capture APIs.
 
-```powershell
-cmake -S . -B build -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-```
+## How it works
 
-If C++/WinRT headers are available (for example through a vcpkg `cppwinrt` package), the app uses Windows Graphics Capture and can capture a window even when it is partly occluded. Without those headers the same UI falls back to a visible-window GDI capture. The fallback is useful for development but cannot capture minimized or protected surfaces.
+The stitcher combines two signals:
+
+- The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate.
+- Frame-to-frame pixel registration finds the exact vertical displacement and rejects ambiguous matches.
+- A low-difference row inside the overlap becomes the seam.
+- Accepted strips are written to temporary disk-backed storage, avoiding an ever-growing screenshot in RAM.
+
+The user always scrolls manually. The app only observes captured frames and never sends input to the target window.
 
 ## Use
 
-1. Select a top-level target window and click **Refresh** if it was opened after launch.
-2. Click **Capture preview** once. The app fills the client size and attempts to locate a scrollbar near either edge.
-3. Verify the scaled preview. The green rectangle is the content viewport and the orange rectangle is the scrollbar track. Drag inside either rectangle to move it, or drag an edge to resize it; the numeric fields stay synchronized. Coordinates are pixels in the captured image; the viewport should exclude fixed chrome and the scrollbar. The track rectangle should cover the scrollbar track, not just the thumb.
-4. Click **Start** and manually scroll down in small increments. The app never sends input to the target window.
-5. Stop after the last content is visible, then choose **Export PNG/JPEG**.
+1. Select a top-level target window. Click **Refresh** if it was opened after the stitcher.
+2. Click **Capture preview**. The preview scales to the app window and highlights distinct scrollbar candidates near both edges.
+3. Click the correct numbered candidate to make it the orange selected scrollbar. The green rectangle is the content viewport. Drag inside either rectangle to move it, or drag an edge to resize it. The viewport should exclude fixed window chrome and the scrollbar.
+4. Click **Start**, switch to the target, and manually scroll downward in small increments.
+5. After the last content is visible, click **Stop**, then **Export PNG/JPEG**.
 
-When the scrollbar moves but no reliable visual overlap can be found, the session pauses and reports a gap. Slow down and continue only after starting a new session; the MVP deliberately does not guess across a missing overlap. A scrollbar that changes appearance or disappears can be handled by changing the track fields and starting again.
+If the scrollbar moves but no reliable visual overlap is found, the session pauses instead of guessing across a gap. Start a new session and scroll in smaller increments.
 
-## Algorithm notes and limitations
+## Portable release pipeline
 
-The current MVP assumes a single vertically scrolling viewport whose width and height remain constant. It supports downward scrolling only. It is not reliable for animated/parallax content, rapidly changing lists, horizontal scrolling, zoom changes, window resizes, or a scroll gesture larger than one viewport. The detector is heuristic and works best when the scrollbar thumb has a different luminance from its track; the manual track controls are the fallback for custom scrollbars.
+The GitHub Actions workflow builds and tests a statically linked x64 Release executable. Each run uploads a `UniversalScrollStitcher-windows-x64` artifact containing the contents of `release-candidate/`. Pushing a tag such as `v0.1.0` also publishes the ZIP to GitHub Releases; tags containing a suffix such as `v0.1.0-rc.1` are marked as prereleases.
 
-PNG is preferred for UI text. Export reads bounded chunks directly from the temporary raw strip store into WIC, so finalization and export do not allocate the complete stitched image. JPEG export exposes a quality setting in code and automatically splits images taller than the JPEG 65,535-pixel limit into numbered parts (using a conservative 65,000-row part size for codec compatibility). PNG uses the same bounded part size on Windows codecs that reject dimensions at the nominal edge. Temporary raw strips remain available while the finalized session is open and are removed when the next session starts or the process exits normally.
+To make the same portable folder locally:
 
-The executable needs the Microsoft Visual C++ runtime matching the build architecture. A WGC build additionally needs a Windows 10/11 SDK and C++/WinRT headers at build time; C++/WinRT is header-only at runtime. If WGC is unavailable, the application uses the visible-window GDI fallback and the target must remain visible and unminimized.
+```powershell
+cmake -S . -B build-portable -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake --build build-portable --config Release
+ctest --test-dir build-portable -C Release --output-on-failure
+cmake --install build-portable --config Release --prefix release-candidate
+```
 
-The repository is intentionally independent from `UmaUmaChecker`; it does not modify or link the parent checkout.
+The generated `release-candidate/` folder is intentionally ignored by Git because GitHub Actions recreates it from a clean build.
+
+## Developer build
+
+Requirements:
+
+- Visual Studio 2022 with the Desktop development with C++ workload
+- Windows 10/11 SDK
+- CMake 3.24 or newer
+- vcpkg
+
+Dependencies are declared in [`vcpkg.json`](vcpkg.json). If C++/WinRT headers are present, Windows Graphics Capture can capture a window while it is partly occluded. Otherwise, the app falls back to visible-window GDI capture.
+
+## Current limitations
+
+- One vertical, downward-scrolling viewport per session
+- The viewport size must remain constant during capture
+- Large jumps exceeding the visible overlap will pause the session
+- Animated, parallax, rapidly changing, zoomed, or horizontally scrolling content may not stitch reliably
+- Custom scrollbars with little contrast may require manual track adjustment
+- JPEG exports taller than the Windows codec limit are split into numbered parts; PNG is preferred for UI text
+
+The repository is independent from `UmaUmaChecker` and does not link or modify it.

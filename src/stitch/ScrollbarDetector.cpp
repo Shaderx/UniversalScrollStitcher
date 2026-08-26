@@ -102,35 +102,65 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
 } // namespace
 
 std::optional<ScrollbarConfig> ScrollbarDetector::autoDetect(const cv::Mat& bgra) {
-    if (bgra.empty() || bgra.type() != CV_8UC4 || bgra.cols < 32 || bgra.rows < 64) return std::nullopt;
+    const auto candidates = autoDetectAll(bgra);
+    if (candidates.empty()) return std::nullopt;
+    return candidates.front().config;
+}
+
+std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& bgra) {
+    std::vector<ScrollbarCandidate> candidates;
+    if (bgra.empty() || bgra.type() != CV_8UC4 || bgra.cols < 32 || bgra.rows < 64) return candidates;
 
     const int candidateWidth = std::clamp(static_cast<int>(std::round(bgra.cols * 0.025)), 8, 28);
     const int searchWidth = std::max(candidateWidth + 2, static_cast<int>(std::round(bgra.cols * 0.12)));
-    RunResult best;
-    Rect bestTrack;
-    ScrollbarSide bestSide = ScrollbarSide::Right;
 
-    for (int x = 0; x <= searchWidth - candidateWidth; ++x) {
-        const Rect candidate{x, 0, candidateWidth, bgra.rows};
-        const RunResult result = findRun(bgra, candidate);
-        if (result.confidence > best.confidence) {
-            best = result;
-            bestTrack = candidate;
-            bestSide = ScrollbarSide::Left;
+    auto collect = [&](int firstX, int lastX, ScrollbarSide side) {
+        for (int x = firstX; x <= lastX; ++x) {
+            const Rect track{x, 0, candidateWidth, bgra.rows};
+            const RunResult run = findRun(bgra, track);
+            if (run.confidence < 0.18F || run.bottom <= run.top) continue;
+            candidates.push_back({
+                {track, side, true},
+                {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence}});
         }
-    }
-    for (int x = bgra.cols - searchWidth; x <= bgra.cols - candidateWidth; ++x) {
-        const Rect candidate{x, 0, candidateWidth, bgra.rows};
-        const RunResult result = findRun(bgra, candidate);
-        if (result.confidence > best.confidence) {
-            best = result;
-            bestTrack = candidate;
-            bestSide = ScrollbarSide::Right;
+    };
+
+    collect(0, searchWidth - candidateWidth, ScrollbarSide::Left);
+    collect(bgra.cols - searchWidth, bgra.cols - candidateWidth, ScrollbarSide::Right);
+
+    std::sort(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& left,
+                                                       const ScrollbarCandidate& right) {
+        if (std::fabs(left.observation.confidence - right.observation.confidence) > 0.001F) {
+            return left.observation.confidence > right.observation.confidence;
         }
+        if (left.config.side != right.config.side) {
+            return left.config.side == ScrollbarSide::Right;
+        }
+        // Saturated confidence scores are common for high-contrast thumbs.
+        // Prefer the strip closest to its declared window edge so the chosen
+        // cluster representative covers the complete scrollbar rather than a
+        // partial overlap with neighboring content.
+        return left.config.side == ScrollbarSide::Left
+            ? left.config.track.x < right.config.track.x
+            : left.config.track.x > right.config.track.x;
+    });
+
+    // Sliding a narrow detector across one scrollbar creates several nearly
+    // identical hits. Keep only the strongest member of each horizontal
+    // cluster while preserving genuinely separate scrollbars.
+    std::vector<ScrollbarCandidate> distinct;
+    constexpr std::size_t kMaximumCandidates = 12;
+    for (const auto& candidate : candidates) {
+        const int center = candidate.config.track.x + candidate.config.track.width / 2;
+        const bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const ScrollbarCandidate& existing) {
+            const int existingCenter = existing.config.track.x + existing.config.track.width / 2;
+            return std::abs(center - existingCenter) <= candidateWidth;
+        });
+        if (!duplicate) distinct.push_back(candidate);
+        if (distinct.size() == kMaximumCandidates) break;
     }
 
-    if (!bestTrack.valid() || best.confidence < 0.18F) return std::nullopt;
-    return ScrollbarConfig{bestTrack, bestSide, true};
+    return distinct;
 }
 
 ScrollbarObservation ScrollbarDetector::detect(const cv::Mat& bgra, const ScrollbarConfig& config) {

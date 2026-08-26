@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
 #include <windowsx.h>
 
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,8 +45,12 @@ enum ControlId : int {
     kTrackY = 131,
     kTrackWidth = 132,
     kTrackHeight = 133,
-    kStatus = 150
+    kStatus = 150,
+    kLatestRelease = 151
 };
+
+constexpr wchar_t kLatestReleaseUrl[] =
+    L"https://github.com/Shaderx/UniversalScrollStitcher/releases/latest";
 
 struct WindowInfo {
     HWND handle = nullptr;
@@ -87,6 +93,8 @@ private:
     HWND targetCombo_ = nullptr;
     HWND previewCanvas_ = nullptr;
     HWND status_ = nullptr;
+    HWND latestReleaseLink_ = nullptr;
+    HFONT latestReleaseFont_ = nullptr;
     std::array<HWND, 4> viewportEdits_{};
     std::array<HWND, 4> trackEdits_{};
     std::vector<WindowInfo> windows_;
@@ -94,8 +102,11 @@ private:
     HWND target_ = nullptr;
     HWND sourceTarget_ = nullptr;
     cv::Mat preview_;
+    std::vector<ScrollbarCandidate> scrollbarCandidates_;
+    std::optional<std::size_t> selectedScrollbarCandidate_;
     StitchSession session_;
     bool capturing_ = false;
+    bool updatingCalibrationEdits_ = false;
 
     enum class CanvasTarget { None, Viewport, Track };
     enum CanvasEdge : int { EdgeNone = 0, EdgeLeft = 1, EdgeTop = 2, EdgeRight = 4, EdgeBottom = 8 };
@@ -153,21 +164,50 @@ private:
             return 0;
         case WM_COMMAND:
             if (HIWORD(wParam) == BN_CLICKED) onButton(LOWORD(wParam));
-            if (HIWORD(wParam) == EN_CHANGE) InvalidateRect(previewCanvas_, nullptr, FALSE);
+            if (LOWORD(wParam) == kLatestRelease && HIWORD(wParam) == STN_CLICKED) {
+                ShellExecuteW(window_, L"open", kLatestReleaseUrl, nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            if (HIWORD(wParam) == EN_CHANGE) {
+                const int id = LOWORD(wParam);
+                if (!updatingCalibrationEdits_ && id >= kTrackX && id <= kTrackHeight) {
+                    selectedScrollbarCandidate_.reset();
+                }
+                InvalidateRect(previewCanvas_, nullptr, FALSE);
+            }
             return 0;
         case WM_TIMER:
             if (wParam == kTimer) captureTick();
             return 0;
         case WM_SIZE:
-            if (previewCanvas_) {
+            if (wParam != SIZE_MINIMIZED) {
                 const int width = std::max(100, LOWORD(lParam) - 36);
-                const int height = std::max(160, HIWORD(lParam) - 445);
-                MoveWindow(previewCanvas_, 18, 425, width, height, TRUE);
+                const int clientHeight = HIWORD(lParam);
+                const int height = std::max(160, clientHeight - 478);
+                if (previewCanvas_) MoveWindow(previewCanvas_, 18, 425, width, height, TRUE);
+                if (latestReleaseLink_) {
+                    MoveWindow(latestReleaseLink_, 18, std::max(0, clientHeight - 38), width, 22, TRUE);
+                }
+                // StretchDIBits uses the current child-client size on every
+                // paint. Force a complete child repaint here so resizing the
+                // main window immediately rescales the existing preview.
+                if (previewCanvas_) {
+                    RedrawWindow(previewCanvas_, nullptr, nullptr,
+                                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+                }
             }
             return 0;
+        case WM_CTLCOLORSTATIC:
+            if (reinterpret_cast<HWND>(lParam) == latestReleaseLink_) {
+                const HDC dc = reinterpret_cast<HDC>(wParam);
+                SetTextColor(dc, RGB(0, 102, 204));
+                SetBkMode(dc, TRANSPARENT);
+                return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+            }
+            return DefWindowProcW(window_, message, wParam, lParam);
         case WM_DESTROY:
             KillTimer(window_, kTimer);
             if (source_) source_->stop();
+            if (latestReleaseFont_) DeleteObject(latestReleaseFont_);
             PostQuitMessage(0);
             return 0;
         default:
@@ -227,7 +267,22 @@ private:
         addLabel(L"Preview: drag inside a rectangle to move it; drag an edge to resize it.", 18, 400, 740);
         previewCanvas_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"UniversalScrollStitcherPreview", nullptr,
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         18, 425, 760, 380, window_, nullptr, instance_, this);
+                                         18, 425, 760, 347, window_, nullptr, instance_, this);
+
+        latestReleaseLink_ = CreateWindowExW(
+            0, L"STATIC", L"Credits - Get the latest portable release from GitHub",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | SS_NOTIFY,
+            18, 812, 760, 22, window_, menuId(kLatestRelease), instance_, nullptr);
+        LOGFONTW fontDescription{};
+        const HFONT defaultFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        if (defaultFont && GetObjectW(defaultFont, sizeof(fontDescription), &fontDescription)) {
+            fontDescription.lfUnderline = TRUE;
+            latestReleaseFont_ = CreateFontIndirectW(&fontDescription);
+            if (latestReleaseFont_) {
+                SendMessageW(latestReleaseLink_, WM_SETFONT,
+                             reinterpret_cast<WPARAM>(latestReleaseFont_), TRUE);
+            }
+        }
     }
 
     void refreshTargets() {
@@ -271,8 +326,11 @@ private:
     }
 
     void setRect(const std::array<HWND, 4>& edits, const Rect& rect) {
+        const bool previousUpdating = updatingCalibrationEdits_;
+        updatingCalibrationEdits_ = true;
         setValue(edits[0], rect.x); setValue(edits[1], rect.y);
         setValue(edits[2], rect.width); setValue(edits[3], rect.height);
+        updatingCalibrationEdits_ = previousUpdating;
     }
 
     struct DisplayTransform {
@@ -331,6 +389,39 @@ private:
         return true;
     }
 
+    void selectScrollbarCandidate(std::size_t index, bool announce) {
+        if (index >= scrollbarCandidates_.size()) return;
+        selectedScrollbarCandidate_ = index;
+        setRect(trackEdits_, scrollbarCandidates_[index].config.track);
+        InvalidateRect(previewCanvas_, nullptr, FALSE);
+        if (announce) {
+            const int confidence = static_cast<int>(std::lround(
+                scrollbarCandidates_[index].observation.confidence * 100.0F));
+            setStatus(L"Selected scrollbar candidate #" + std::to_wstring(index + 1) +
+                      L" (confidence " + std::to_wstring(confidence) +
+                      L"%). Drag the orange rectangle to fine-tune it if needed.");
+        }
+    }
+
+    [[nodiscard]] std::optional<std::size_t> scrollbarCandidateAt(const POINT& point,
+                                                                  int radius) const {
+        std::optional<std::size_t> best;
+        int bestDistance = std::numeric_limits<int>::max();
+        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
+            if (selectedScrollbarCandidate_ && *selectedScrollbarCandidate_ == index) continue;
+            int ignoredEdges = EdgeNone;
+            const Rect& track = scrollbarCandidates_[index].config.track;
+            if (!hitRect(track, point, radius, ignoredEdges)) continue;
+            const int center = track.x + track.width / 2;
+            const int distance = std::abs(point.x - center);
+            if (distance < bestDistance) {
+                best = index;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
     void paintPreview(HWND canvas, HDC dc) const {
         RECT client{};
         GetClientRect(canvas, &client);
@@ -360,10 +451,33 @@ private:
         const Rect track = readRect(trackEdits_);
         const RECT viewportRect = scaledRect(viewport, *transform);
         const RECT trackRect = scaledRect(track, *transform);
+        HPEN candidatePen = CreatePen(PS_DOT, 1, RGB(40, 180, 255));
         HPEN viewportPen = CreatePen(PS_SOLID, 2, RGB(50, 220, 90));
         HPEN trackPen = CreatePen(PS_SOLID, 2, RGB(255, 170, 30));
-        HGDIOBJ oldPen = SelectObject(dc, viewportPen);
+        HGDIOBJ oldPen = SelectObject(dc, candidatePen);
         HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(40, 180, 255));
+        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
+            if (selectedScrollbarCandidate_ && *selectedScrollbarCandidate_ == index) continue;
+            const RECT candidateRect = scaledRect(scrollbarCandidates_[index].config.track, *transform);
+            Rectangle(dc, candidateRect.left, candidateRect.top,
+                      candidateRect.right, candidateRect.bottom);
+            const int confidence = static_cast<int>(std::lround(
+                scrollbarCandidates_[index].observation.confidence * 100.0F));
+            const std::wstring label = L"#" + std::to_wstring(index + 1) + L" " +
+                                       std::to_wstring(confidence) + L"%";
+            const LONG labelTop = std::min(candidateRect.bottom - 20,
+                                           candidateRect.top + 3 +
+                                               static_cast<LONG>(index % 12) * 18);
+            RECT labelRect{candidateRect.left + 3, labelTop,
+                           candidateRect.right + 100, labelTop + 19};
+            DrawTextW(dc, label.c_str(), -1, &labelRect,
+                      DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        SelectObject(dc, viewportPen);
         Rectangle(dc, viewportRect.left, viewportRect.top, viewportRect.right, viewportRect.bottom);
         SelectObject(dc, trackPen);
         Rectangle(dc, trackRect.left, trackRect.top, trackRect.right, trackRect.bottom);
@@ -371,14 +485,18 @@ private:
         SelectObject(dc, oldPen);
         DeleteObject(viewportPen);
         DeleteObject(trackPen);
+        DeleteObject(candidatePen);
 
-        SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(50, 220, 90));
         RECT viewportLabel{viewportRect.left + 4, viewportRect.top + 3, viewportRect.right - 4, viewportRect.top + 22};
         DrawTextW(dc, L"CONTENT VIEWPORT", -1, &viewportLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
         SetTextColor(dc, RGB(255, 170, 30));
         RECT trackLabel{trackRect.left + 4, trackRect.top + 3, trackRect.right + 150, trackRect.top + 22};
-        DrawTextW(dc, L"SCROLLBAR TRACK", -1, &trackLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const std::wstring trackText = selectedScrollbarCandidate_
+            ? L"SCROLLBAR #" + std::to_wstring(*selectedScrollbarCandidate_ + 1) + L" SELECTED"
+            : L"SCROLLBAR TRACK (MANUAL)";
+        DrawTextW(dc, trackText.c_str(), -1, &trackLabel,
+                  DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     void beginPreviewDrag(HWND canvas, int clientX, int clientY) {
@@ -389,6 +507,10 @@ private:
         const Rect track = readRect(trackEdits_);
         int trackEdges = EdgeNone;
         int viewportEdges = EdgeNone;
+        if (const auto candidate = scrollbarCandidateAt(imagePoint, radius)) {
+            selectScrollbarCandidate(*candidate, true);
+            return;
+        }
         const bool hitTrack = hitRect(track, imagePoint, radius, trackEdges);
         const bool hitViewport = hitRect(viewport, imagePoint, radius, viewportEdges);
         if (hitTrack) {
@@ -460,6 +582,9 @@ private:
             EndPaint(canvas, &paint);
             return 0;
         }
+        case WM_SIZE:
+            InvalidateRect(canvas, nullptr, TRUE);
+            return 0;
         case WM_LBUTTONDOWN:
             SetFocus(canvas);
             beginPreviewDrag(canvas, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
@@ -506,6 +631,8 @@ private:
         // a failed recapture leave the previous target's image/coordinates in
         // place, and discard any finalized session tied to that image.
         preview_.release();
+        scrollbarCandidates_.clear();
+        selectedScrollbarCandidate_.reset();
         session_.reset();
         InvalidateRect(previewCanvas_, nullptr, TRUE);
         source_ = createFrameSource(target_);
@@ -526,13 +653,17 @@ private:
         }
         preview_ = std::move(captured);
         setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
-        const auto detected = ScrollbarDetector::autoDetect(preview_);
-        if (detected) setRect(trackEdits_, detected->track);
+        scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
+        if (!scrollbarCandidates_.empty()) selectScrollbarCandidate(0, false);
         else setRect(trackEdits_, {std::max(0, preview_.cols - 18), 0, 18, preview_.rows});
         std::wstring message = L"Preview captured by " + source_->name() + L" (" +
             std::to_wstring(preview_.cols) + L"x" + std::to_wstring(preview_.rows) + L"). ";
-        message += detected ? L"Scrollbar candidate detected; adjust fields if needed." :
-                               L"No scrollbar candidate found; set the track fields manually.";
+        if (!scrollbarCandidates_.empty()) {
+            message += std::to_wstring(scrollbarCandidates_.size()) +
+                       L" scrollbar candidate(s) highlighted. Click the correct numbered candidate.";
+        } else {
+            message += L"No scrollbar candidate found; set the orange track manually.";
+        }
         setStatus(message);
         InvalidateRect(previewCanvas_, nullptr, TRUE);
     }
@@ -540,13 +671,17 @@ private:
     void autoDetectScrollbar() {
         if (preview_.empty()) capturePreview();
         if (preview_.empty()) return;
-        const auto detected = ScrollbarDetector::autoDetect(preview_);
-        if (!detected) {
+        scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
+        selectedScrollbarCandidate_.reset();
+        if (scrollbarCandidates_.empty()) {
             setStatus(L"No scrollbar candidate was found. Set the track rectangle manually.");
+            InvalidateRect(previewCanvas_, nullptr, FALSE);
             return;
         }
-        setRect(trackEdits_, detected->track);
-        setStatus(L"Scrollbar candidate applied. Verify or adjust its X/Y/width/height fields.");
+        selectScrollbarCandidate(0, false);
+        setStatus(std::to_wstring(scrollbarCandidates_.size()) +
+                  L" scrollbar candidate(s) highlighted. Click the correct numbered candidate; "
+                  L"the orange rectangle is currently selected.");
     }
 
     void startCapture() {

@@ -5,6 +5,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -44,6 +45,23 @@ cv::Mat fullFrame(int documentOffset, int thumbTop, int width = 120, int height 
     }
     for (int y = thumbTop; y < thumbTop + 18 && y < height; ++y) {
         for (int x = 112; x < 120; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(35, 35, 35, 255);
+    }
+    return frame;
+}
+
+cv::Mat multipleScrollbarFrame() {
+    constexpr int width = 160;
+    constexpr int height = 120;
+    cv::Mat frame(height, width, CV_8UC4, cv::Scalar(25, 25, 25, 255));
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < 8; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(210, 210, 210, 255);
+        for (int x = width - 8; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(205, 205, 205, 255);
+    }
+    for (int y = 12; y < 34; ++y) {
+        for (int x = 0; x < 8; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(35, 35, 35, 255);
+    }
+    for (int y = 64; y < 88; ++y) {
+        for (int x = width - 8; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(45, 45, 45, 255);
     }
     return frame;
 }
@@ -88,6 +106,20 @@ void testScrollbarDetection() {
     require(bottom.detected, "bottom scrollbar should be detected");
     require(std::abs(bottom.thumbTop() - 78) <= 2, "bottom thumb top should be measured");
     require(std::abs(bottom.thumbBottom() - 96) <= 2, "bottom thumb should terminate at track bottom");
+}
+
+void testMultipleScrollbarCandidates() {
+    const auto candidates = ScrollbarDetector::autoDetectAll(multipleScrollbarFrame());
+    require(candidates.size() == 2, "two distinct edge scrollbars should produce two candidates");
+    const bool hasLeft = std::any_of(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& candidate) {
+        return candidate.config.side == ScrollbarSide::Left && candidate.config.track.x <= 2;
+    });
+    const bool hasRight = std::any_of(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& candidate) {
+        return candidate.config.side == ScrollbarSide::Right && candidate.config.track.right() >= 158;
+    });
+    require(hasLeft && hasRight, "candidate list should preserve both scrollbar locations");
+    const auto best = ScrollbarDetector::autoDetect(multipleScrollbarFrame());
+    require(best.has_value(), "legacy best-candidate API should remain available");
 }
 
 void testSessionAssembly() {
@@ -153,6 +185,7 @@ int main() {
     testShiftAndSeam();
     testDisagreementIsRejected();
     testScrollbarDetection();
+    testMultipleScrollbarCandidates();
     testSessionAssembly();
     testPausedSessionCanFinalizePrefix();
     std::cout << "UniversalScrollStitcher core tests passed\n";
