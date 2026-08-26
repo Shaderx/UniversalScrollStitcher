@@ -1,0 +1,19 @@
+# CMake and Visual Studio output
+/build/
+/build_*/
+/out/
+/vcpkg_installed/
+/.vs/
+*.suo
+*.user
+
+# Runtime capture scratch files
+*.usstitch
+
+# Compiled artifacts
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
