@@ -45,7 +45,14 @@ public:
     void reset();
 
     [[nodiscard]] SessionState state() const noexcept { return state_; }
+    // The finalized image remains in the disk-backed store. Use outputStore()
+    // for streaming export; finalImage() is retained only as a compatibility
+    // accessor and is intentionally empty for long-capture safety.
     [[nodiscard]] const cv::Mat& finalImage() const noexcept { return finalImage_; }
+    [[nodiscard]] const StripStore& outputStore() const noexcept { return store_; }
+    [[nodiscard]] bool hasOutput() const noexcept {
+        return state_ == SessionState::Finalized && store_.isOpen() && store_.rows() > 0;
+    }
     [[nodiscard]] const std::string& lastMessage() const noexcept { return lastMessage_; }
     [[nodiscard]] int acceptedFrames() const noexcept { return acceptedFrames_; }
     [[nodiscard]] int outputRows() const noexcept { return outputRows_; }
@@ -65,4 +72,3 @@ private:
 };
 
 } // namespace universal_stitcher
-

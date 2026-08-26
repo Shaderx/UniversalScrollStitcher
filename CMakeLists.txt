@@ -11,6 +11,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
+if (WIN32)
+    # OpenCV is dynamically linked by the vcpkg package. Ship the complete
+    # runtime set beside every executable so double-clicking the app (or
+    # running a test from its output directory) does not depend on PATH,
+    # Visual Studio, or a developer prompt.
+    get_filename_component(UNIVERSAL_STITCHER_OPENCV_ROOT
+        "${OpenCV_DIR}/../.." ABSOLUTE)
+    file(GLOB UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS
+        "${UNIVERSAL_STITCHER_OPENCV_ROOT}/bin/*.dll")
+    if (NOT UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS)
+        message(WARNING "No OpenCV runtime DLLs found under ${UNIVERSAL_STITCHER_OPENCV_ROOT}/bin")
+    endif()
+
+    function(copy_opencv_runtime target)
+        foreach(runtime_dll IN LISTS UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${runtime_dll}" "$<TARGET_FILE_DIR:${target}>"
+                VERBATIM)
+        endforeach()
+    endfunction()
+endif()
+
 add_library(stitch_core
     src/stitch/ScrollbarDetector.cpp
     src/stitch/VerticalShiftEstimator.cpp
@@ -29,15 +52,22 @@ else()
 endif()
 
 if (WIN32)
+    add_library(stitch_export
+        src/export/ImageExporter.cpp
+    )
+    target_include_directories(stitch_export PUBLIC include)
+    target_link_libraries(stitch_export PUBLIC stitch_core windowscodecs ole32)
+    target_compile_definitions(stitch_export PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+
     add_executable(UniversalScrollStitcher WIN32
         src/main.cpp
         src/capture/WindowCapture.cpp
         src/capture/GraphicsCaptureSource.cpp
-        src/export/ImageExporter.cpp
     )
     target_include_directories(UniversalScrollStitcher PRIVATE include)
-    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core user32 gdi32 shcore dwmapi windowscodecs ole32 comdlg32)
+    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export user32 gdi32 shcore dwmapi comdlg32)
     target_compile_definitions(UniversalScrollStitcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    copy_opencv_runtime(UniversalScrollStitcher)
 
     if (UNIVERSAL_STITCHER_ENABLE_WGC)
         find_path(CPPWINRT_INCLUDE_DIR winrt/base.h
@@ -64,4 +94,14 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
     target_link_libraries(stitch_core_tests PRIVATE stitch_core)
     target_include_directories(stitch_core_tests PRIVATE include)
     add_test(NAME stitch_core_tests COMMAND stitch_core_tests)
+    if (WIN32)
+        add_executable(stitch_export_tests tests/export_tests.cpp)
+        target_link_libraries(stitch_export_tests PRIVATE stitch_export)
+        target_include_directories(stitch_export_tests PRIVATE include)
+        add_test(NAME stitch_export_tests COMMAND stitch_export_tests)
+        copy_opencv_runtime(stitch_core_tests)
+        copy_opencv_runtime(stitch_export_tests)
+        set_tests_properties(stitch_core_tests stitch_export_tests
+            PROPERTIES RUN_SERIAL TRUE)
+    endif()
 endif()

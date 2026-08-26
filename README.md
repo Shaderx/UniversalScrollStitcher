@@ -26,7 +26,7 @@ If C++/WinRT headers are available (for example through a vcpkg `cppwinrt` packa
 
 1. Select a top-level target window and click **Refresh** if it was opened after launch.
 2. Click **Capture preview** once. The app fills the client size and attempts to locate a scrollbar near either edge.
-3. Check or adjust the viewport and scrollbar track fields. Coordinates are pixels in the captured image; the viewport should exclude fixed chrome and the scrollbar. The track rectangle should cover the scrollbar track, not just the thumb.
+3. Verify the scaled preview. The green rectangle is the content viewport and the orange rectangle is the scrollbar track. Drag inside either rectangle to move it, or drag an edge to resize it; the numeric fields stay synchronized. Coordinates are pixels in the captured image; the viewport should exclude fixed chrome and the scrollbar. The track rectangle should cover the scrollbar track, not just the thumb.
 4. Click **Start** and manually scroll down in small increments. The app never sends input to the target window.
 5. Stop after the last content is visible, then choose **Export PNG/JPEG**.
 
@@ -36,6 +36,8 @@ When the scrollbar moves but no reliable visual overlap can be found, the sessio
 
 The current MVP assumes a single vertically scrolling viewport whose width and height remain constant. It supports downward scrolling only. It is not reliable for animated/parallax content, rapidly changing lists, horizontal scrolling, zoom changes, window resizes, or a scroll gesture larger than one viewport. The detector is heuristic and works best when the scrollbar thumb has a different luminance from its track; the manual track controls are the fallback for custom scrollbars.
 
-PNG is preferred for UI text. JPEG export exposes a quality setting in code and automatically splits images taller than the JPEG 65,535-pixel limit into numbered parts. Temporary raw strips are removed after a successful session finalization or when the process exits normally.
+PNG is preferred for UI text. Export reads bounded chunks directly from the temporary raw strip store into WIC, so finalization and export do not allocate the complete stitched image. JPEG export exposes a quality setting in code and automatically splits images taller than the JPEG 65,535-pixel limit into numbered parts (using a conservative 65,000-row part size for codec compatibility). PNG uses the same bounded part size on Windows codecs that reject dimensions at the nominal edge. Temporary raw strips remain available while the finalized session is open and are removed when the next session starts or the process exits normally.
+
+The executable needs the Microsoft Visual C++ runtime matching the build architecture. A WGC build additionally needs a Windows 10/11 SDK and C++/WinRT headers at build time; C++/WinRT is header-only at runtime. If WGC is unavailable, the application uses the visible-window GDI fallback and the target must remain visible and unminimized.
 
 The repository is intentionally independent from `UmaUmaChecker`; it does not modify or link the parent checkout.

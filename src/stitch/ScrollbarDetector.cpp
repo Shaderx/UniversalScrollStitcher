@@ -6,7 +6,6 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
-#include <utility>
 #include <vector>
 
 namespace universal_stitcher {
@@ -55,7 +54,11 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
 
     const float baseline = median(smoothed);
     for (std::size_t i = 0; i < smoothed.size(); ++i) {
-        deviations[i] = std::fabs(smoothed[i] - baseline);
+        // Use the smoothed signal only to establish the track baseline. Use
+        // unsmoothed row luminance for the run itself so the detector reports
+        // the actual thumb edges instead of expanding them by the smoothing
+        // kernel radius.
+        deviations[i] = std::fabs(rows[i] - baseline);
     }
 
     std::vector<float> sorted = deviations;
@@ -75,15 +78,19 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
         if (active && runStart < 0) runStart = i;
         if ((!active || i == track.height) && runStart >= 0) {
             const int runEnd = i;
-            runStart = std::exchange(runStart, -1);
-            const int length = runEnd - runStart;
+            // Keep the start before resetting it.  Assigning std::exchange's
+            // return value back to runStart restores the old value and makes
+            // the run consume every later row (the old audit bug).
+            const int completedStart = runStart;
+            runStart = -1;
+            const int length = runEnd - completedStart;
             if (length >= minimumRun && length < static_cast<int>(track.height * 0.80F)) {
                 float peak = 0.0F;
-                for (int row = runStart; row < runEnd; ++row) peak = std::max(peak, deviations[static_cast<std::size_t>(row)]);
+                for (int row = completedStart; row < runEnd; ++row) peak = std::max(peak, deviations[static_cast<std::size_t>(row)]);
                 const float compactness = 1.0F - std::fabs(static_cast<float>(length) - track.height * 0.12F) / std::max(1.0F, track.height * 0.88F);
                 const float score = peak * (0.65F + 0.35F * std::max(0.0F, compactness));
                 if (score > best.confidence) {
-                    best = {runStart + track.y, runEnd + track.y,
+                    best = {completedStart + track.y, runEnd + track.y,
                             std::clamp(score / 64.0F, 0.0F, 1.0F)};
                 }
             }

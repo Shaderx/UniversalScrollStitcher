@@ -1,5 +1,7 @@
 #pragma once
 
+#include "universal_stitcher/StripStore.h"
+
 #include <opencv2/core.hpp>
 
 #include <filesystem>
@@ -23,7 +25,9 @@ public:
     [[nodiscard]] static ExportResult write(const cv::Mat& bgra,
                                             const std::filesystem::path& requestedPath,
                                             const ExportOptions& options = {});
+    [[nodiscard]] static ExportResult write(const StripStore& store,
+                                            const std::filesystem::path& requestedPath,
+                                            const ExportOptions& options = {});
 };
 
 } // namespace universal_stitcher
-

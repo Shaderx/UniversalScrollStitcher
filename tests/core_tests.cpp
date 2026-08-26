@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -76,9 +77,17 @@ void testScrollbarDetection() {
     const ScrollbarObservation observation = ScrollbarDetector::detect(frame, config);
     require(observation.detected, "configured scrollbar should be detected");
     require(std::abs(observation.thumbTop() - 20) <= 2, "thumb top should be measured");
+    require(std::abs(observation.thumb.height - 18) <= 2, "thumb height should be measured exactly");
+    require(std::abs(observation.thumbBottom() - 38) <= 2, "thumb bottom should be measured exactly");
     require(observation.confidence > 0.50F, "scrollbar confidence should be useful");
     const auto automatic = ScrollbarDetector::autoDetect(frame);
     require(automatic.has_value(), "edge scrollbar should be auto-detected");
+
+    const cv::Mat bottomFrame = fullFrame(0, 78);
+    const ScrollbarObservation bottom = ScrollbarDetector::detect(bottomFrame, config);
+    require(bottom.detected, "bottom scrollbar should be detected");
+    require(std::abs(bottom.thumbTop() - 78) <= 2, "bottom thumb top should be measured");
+    require(std::abs(bottom.thumbBottom() - 96) <= 2, "bottom thumb should terminate at track bottom");
 }
 
 void testSessionAssembly() {
@@ -92,8 +101,50 @@ void testSessionAssembly() {
     const StitchUpdate second = session.process(fullFrame(16, 10));
     require(second.accepted, "second manual scroll should be accepted");
     require(session.finish(), "session should finalize");
-    require(session.finalImage().rows > 96, "assembled image should contain newly exposed rows");
-    require(session.finalImage().cols == 96, "assembled image should preserve viewport width");
+    require(session.finalImage().empty(), "finalization should not materialize a full image");
+    require(session.hasOutput(), "finalized session should expose a streaming output store");
+    const cv::Mat assembled = session.outputStore().readAll();
+    require(assembled.rows == 112, "assembled image should have exact expected height");
+    require(assembled.cols == 96, "assembled image should preserve viewport width");
+
+    cv::Mat expected(112, 96, CV_8UC4);
+    documentFrame(0, 96, 11).copyTo(expected(cv::Rect(0, 0, 96, 11)));
+    documentFrame(8, 96, 96)(cv::Rect(0, 3, 96, 8)).copyTo(expected(cv::Rect(0, 11, 96, 8)));
+    documentFrame(16, 96, 96)(cv::Rect(0, 3, 96, 93)).copyTo(expected(cv::Rect(0, 19, 96, 93)));
+    require(cv::countNonZero(assembled.reshape(1) != expected.reshape(1)) == 0,
+            "assembled pixels should exactly match the expected overlap cuts");
+
+    std::uint64_t callbackRows = 0;
+    require(session.outputStore().forEachChunk(
+                [&](const std::uint8_t* bytes, int rows, int width, std::uint64_t firstRow) {
+                    require(bytes != nullptr && width == 96, "stream callback should receive valid rows");
+                    require(firstRow == callbackRows, "stream callback rows should be ordered");
+                    callbackRows += static_cast<std::uint64_t>(rows);
+                    return true;
+                }), "store should stream all chunks");
+    require(callbackRows == 112, "stream callback should cover the complete output");
+
+    const StitchUpdate bad = session.process(fullFrame(30, 20));
+    require(!bad.accepted && !bad.paused, "frames after finalization should be ignored");
+    session.reset();
+    require(session.state() == SessionState::Idle && !session.hasOutput(),
+            "reset should discard finalized output and session state");
+}
+
+void testPausedSessionCanFinalizePrefix() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(fullFrame(0, 2), options), "pause test session should start");
+    cv::Mat unrelated = fullFrame(37, 20);
+    unrelated(cv::Rect(0, 0, 96, 96)).setTo(cv::Scalar(7, 31, 99, 255));
+    const StitchUpdate update = session.process(unrelated);
+    require(update.paused, "a rejected visual overlap should pause the session");
+    require(session.state() == SessionState::Paused, "session should report paused state");
+    require(session.finish(), "stop should finalize the valid prefix after a pause");
+    require(session.hasOutput() && session.outputStore().rows() == 96,
+            "paused finalization should preserve the initial viewport");
 }
 
 } // namespace
@@ -103,6 +154,7 @@ int main() {
     testDisagreementIsRejected();
     testScrollbarDetection();
     testSessionAssembly();
+    testPausedSessionCanFinalizePrefix();
     std::cout << "UniversalScrollStitcher core tests passed\n";
     return 0;
 }

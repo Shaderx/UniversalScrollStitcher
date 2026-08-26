@@ -46,7 +46,9 @@ std::optional<CaptureFrame> GdiCaptureSource::capture() {
     info.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     HBITMAP bitmap = CreateDIBSection(memory, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bitmap || !bits || SelectObject(memory, bitmap) == nullptr) {
+    HGDIOBJ previousBitmap = nullptr;
+    if (bitmap && bits) previousBitmap = SelectObject(memory, bitmap);
+    if (!bitmap || !bits || previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
         if (bitmap) DeleteObject(bitmap);
         DeleteDC(memory);
         ReleaseDC(target_, source);
@@ -59,7 +61,13 @@ std::optional<CaptureFrame> GdiCaptureSource::capture() {
         const cv::Mat view(height, width, CV_8UC4, bits, static_cast<std::size_t>(width) * 4U);
         frame.bgra = view.clone();
     }
-    DeleteObject(bitmap);
+    if (SelectObject(memory, previousBitmap) == HGDI_ERROR) {
+        // The bitmap is still selected only on a broken DC. Do not attempt to
+        // delete it in that case; leaking one object is safer than deleting a
+        // selected GDI object and corrupting the capture DC.
+        bitmap = nullptr;
+    }
+    if (bitmap) DeleteObject(bitmap);
     DeleteDC(memory);
     ReleaseDC(target_, source);
     if (!frame.valid()) return std::nullopt;
@@ -81,4 +89,3 @@ std::unique_ptr<IFrameSource> createFrameSource(HWND target) {
 }
 
 } // namespace universal_stitcher
-

@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shellscalingapi.h>
+#include <windowsx.h>
 
 #ifdef UNIVERSAL_STITCHER_HAS_WGC
 #include <winrt/base.h>
@@ -14,7 +15,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cwctype>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,6 +55,13 @@ class MainWindow final {
 public:
     bool create(HINSTANCE instance) {
         instance_ = instance;
+        WNDCLASSEXW previewClass{sizeof(WNDCLASSEXW)};
+        previewClass.lpfnWndProc = &MainWindow::previewProc;
+        previewClass.hInstance = instance;
+        previewClass.hCursor = LoadCursorW(nullptr, IDC_CROSS);
+        previewClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        previewClass.lpszClassName = L"UniversalScrollStitcherPreview";
+        if (!RegisterClassExW(&previewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
         WNDCLASSEXW klass{sizeof(WNDCLASSEXW)};
         klass.lpfnWndProc = &MainWindow::windowProc;
         klass.hInstance = instance;
@@ -59,7 +71,7 @@ public:
         if (!RegisterClassExW(&klass)) return false;
         window_ = CreateWindowExW(0, klass.lpszClassName, L"Universal Scroll Stitcher",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  820, 540, nullptr, nullptr, instance, this);
+                                  820, 850, nullptr, nullptr, instance, this);
         if (!window_) return false;
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
@@ -73,6 +85,7 @@ private:
     HWND window_ = nullptr;
     HINSTANCE instance_ = nullptr;
     HWND targetCombo_ = nullptr;
+    HWND previewCanvas_ = nullptr;
     HWND status_ = nullptr;
     std::array<HWND, 4> viewportEdits_{};
     std::array<HWND, 4> trackEdits_{};
@@ -83,6 +96,13 @@ private:
     cv::Mat preview_;
     StitchSession session_;
     bool capturing_ = false;
+
+    enum class CanvasTarget { None, Viewport, Track };
+    enum CanvasEdge : int { EdgeNone = 0, EdgeLeft = 1, EdgeTop = 2, EdgeRight = 4, EdgeBottom = 8 };
+    CanvasTarget dragTarget_ = CanvasTarget::None;
+    int dragEdges_ = EdgeNone;
+    POINT dragStartImage_{};
+    Rect dragOriginal_{};
 
     static std::wstring widen(const std::string& value) {
         if (value.empty()) return {};
@@ -104,6 +124,17 @@ private:
         return self ? self->handleMessage(message, wParam, lParam) : DefWindowProcW(window, message, wParam, lParam);
     }
 
+    static LRESULT CALLBACK previewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) {
+            auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            self = static_cast<MainWindow*>(create->lpCreateParams);
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        return self ? self->handlePreviewMessage(window, message, wParam, lParam) :
+                      DefWindowProcW(window, message, wParam, lParam);
+    }
+
     static BOOL CALLBACK enumerateWindow(HWND window, LPARAM parameter) {
         auto* context = reinterpret_cast<std::pair<MainWindow*, std::vector<WindowInfo>*>*>(parameter);
         if (!IsWindowVisible(window) || window == context->first->window_) return TRUE;
@@ -122,9 +153,17 @@ private:
             return 0;
         case WM_COMMAND:
             if (HIWORD(wParam) == BN_CLICKED) onButton(LOWORD(wParam));
+            if (HIWORD(wParam) == EN_CHANGE) InvalidateRect(previewCanvas_, nullptr, FALSE);
             return 0;
         case WM_TIMER:
             if (wParam == kTimer) captureTick();
+            return 0;
+        case WM_SIZE:
+            if (previewCanvas_) {
+                const int width = std::max(100, LOWORD(lParam) - 36);
+                const int height = std::max(160, HIWORD(lParam) - 445);
+                MoveWindow(previewCanvas_, 18, 425, width, height, TRUE);
+            }
             return 0;
         case WM_DESTROY:
             KillTimer(window_, kTimer);
@@ -183,8 +222,12 @@ private:
         addLabel(L"The app only captures frames and never sends input to the target.", 18, 260, 560);
         addLabel(L"Scroll down manually in small increments. A scrollbar/visual disagreement pauses the session.", 18, 286, 740);
         status_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Select a target and capture a preview.",
-                                  WS_CHILD | WS_VISIBLE | SS_LEFT, 18, 330, 760, 80,
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT, 18, 330, 760, 75,
                                   window_, menuId(kStatus), instance_, nullptr);
+        addLabel(L"Preview: drag inside a rectangle to move it; drag an edge to resize it.", 18, 400, 740);
+        previewCanvas_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"UniversalScrollStitcherPreview", nullptr,
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                         18, 425, 760, 380, window_, nullptr, instance_, this);
     }
 
     void refreshTargets() {
@@ -232,6 +275,206 @@ private:
         setValue(edits[2], rect.width); setValue(edits[3], rect.height);
     }
 
+    struct DisplayTransform {
+        RECT destination{};
+        double scale = 1.0;
+    };
+
+    [[nodiscard]] std::optional<DisplayTransform> displayTransform(HWND canvas) const {
+        if (preview_.empty()) return std::nullopt;
+        RECT client{};
+        GetClientRect(canvas, &client);
+        const int clientWidth = client.right - client.left;
+        const int clientHeight = client.bottom - client.top;
+        if (clientWidth <= 16 || clientHeight <= 16) return std::nullopt;
+        const double scale = std::min(static_cast<double>(clientWidth - 16) / preview_.cols,
+                                      static_cast<double>(clientHeight - 16) / preview_.rows);
+        if (!(scale > 0.0)) return std::nullopt;
+        const int width = std::max(1, static_cast<int>(std::lround(preview_.cols * scale)));
+        const int height = std::max(1, static_cast<int>(std::lround(preview_.rows * scale)));
+        const int left = (clientWidth - width) / 2;
+        const int top = (clientHeight - height) / 2;
+        return DisplayTransform{{left, top, left + width, top + height}, scale};
+    }
+
+    [[nodiscard]] bool clientToImage(HWND canvas, int clientX, int clientY, POINT& imagePoint) const {
+        const auto transform = displayTransform(canvas);
+        if (!transform) return false;
+        const RECT& destination = transform->destination;
+        if (clientX < destination.left || clientX >= destination.right ||
+            clientY < destination.top || clientY >= destination.bottom) return false;
+        imagePoint.x = std::clamp(static_cast<int>((clientX - destination.left) / transform->scale),
+                                  0, preview_.cols - 1);
+        imagePoint.y = std::clamp(static_cast<int>((clientY - destination.top) / transform->scale),
+                                  0, preview_.rows - 1);
+        return true;
+    }
+
+    static RECT scaledRect(const Rect& rect, const DisplayTransform& transform) {
+        return {
+            transform.destination.left + static_cast<LONG>(std::lround(rect.x * transform.scale)),
+            transform.destination.top + static_cast<LONG>(std::lround(rect.y * transform.scale)),
+            transform.destination.left + static_cast<LONG>(std::lround(rect.right() * transform.scale)),
+            transform.destination.top + static_cast<LONG>(std::lround(rect.bottom() * transform.scale))};
+    }
+
+    static bool hitRect(const Rect& rect, const POINT& point, int radius, int& edges) {
+        if (!rect.valid()) return false;
+        const bool inside = point.x >= rect.x - radius && point.x <= rect.right() + radius &&
+                            point.y >= rect.y - radius && point.y <= rect.bottom() + radius;
+        if (!inside) return false;
+        edges = EdgeNone;
+        if (std::abs(point.x - rect.x) <= radius) edges |= EdgeLeft;
+        if (std::abs(point.y - rect.y) <= radius) edges |= EdgeTop;
+        if (std::abs(point.x - rect.right()) <= radius) edges |= EdgeRight;
+        if (std::abs(point.y - rect.bottom()) <= radius) edges |= EdgeBottom;
+        return true;
+    }
+
+    void paintPreview(HWND canvas, HDC dc) const {
+        RECT client{};
+        GetClientRect(canvas, &client);
+        FillRect(dc, &client, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        if (preview_.empty()) {
+            SetBkMode(dc, TRANSPARENT);
+            DrawTextW(dc, L"Capture a preview to display the target and calibration rectangles.", -1,
+                      &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return;
+        }
+        const auto transform = displayTransform(canvas);
+        if (!transform) return;
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = preview_.cols;
+        bitmapInfo.bmiHeader.biHeight = -preview_.rows;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        const RECT& destination = transform->destination;
+        StretchDIBits(dc, destination.left, destination.top,
+                      destination.right - destination.left, destination.bottom - destination.top,
+                      0, 0, preview_.cols, preview_.rows, preview_.data, &bitmapInfo,
+                      DIB_RGB_COLORS, SRCCOPY);
+
+        const Rect viewport = readRect(viewportEdits_);
+        const Rect track = readRect(trackEdits_);
+        const RECT viewportRect = scaledRect(viewport, *transform);
+        const RECT trackRect = scaledRect(track, *transform);
+        HPEN viewportPen = CreatePen(PS_SOLID, 2, RGB(50, 220, 90));
+        HPEN trackPen = CreatePen(PS_SOLID, 2, RGB(255, 170, 30));
+        HGDIOBJ oldPen = SelectObject(dc, viewportPen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, viewportRect.left, viewportRect.top, viewportRect.right, viewportRect.bottom);
+        SelectObject(dc, trackPen);
+        Rectangle(dc, trackRect.left, trackRect.top, trackRect.right, trackRect.bottom);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(viewportPen);
+        DeleteObject(trackPen);
+
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(50, 220, 90));
+        RECT viewportLabel{viewportRect.left + 4, viewportRect.top + 3, viewportRect.right - 4, viewportRect.top + 22};
+        DrawTextW(dc, L"CONTENT VIEWPORT", -1, &viewportLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SetTextColor(dc, RGB(255, 170, 30));
+        RECT trackLabel{trackRect.left + 4, trackRect.top + 3, trackRect.right + 150, trackRect.top + 22};
+        DrawTextW(dc, L"SCROLLBAR TRACK", -1, &trackLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    void beginPreviewDrag(HWND canvas, int clientX, int clientY) {
+        POINT imagePoint{};
+        if (!clientToImage(canvas, clientX, clientY, imagePoint)) return;
+        const int radius = std::max(4, static_cast<int>(std::ceil(7.0 / displayTransform(canvas)->scale)));
+        const Rect viewport = readRect(viewportEdits_);
+        const Rect track = readRect(trackEdits_);
+        int trackEdges = EdgeNone;
+        int viewportEdges = EdgeNone;
+        const bool hitTrack = hitRect(track, imagePoint, radius, trackEdges);
+        const bool hitViewport = hitRect(viewport, imagePoint, radius, viewportEdges);
+        if (hitTrack) {
+            dragTarget_ = CanvasTarget::Track;
+            dragEdges_ = trackEdges;
+            dragOriginal_ = track;
+        } else if (hitViewport) {
+            dragTarget_ = CanvasTarget::Viewport;
+            dragEdges_ = viewportEdges;
+            dragOriginal_ = viewport;
+        } else {
+            dragTarget_ = CanvasTarget::None;
+            return;
+        }
+        dragStartImage_ = imagePoint;
+        SetCapture(canvas);
+        SetCursor(LoadCursorW(nullptr, (dragEdges_ == EdgeNone) ? IDC_SIZEALL : IDC_SIZEWE));
+    }
+
+    void updatePreviewDrag(HWND canvas, int clientX, int clientY) {
+        if (dragTarget_ == CanvasTarget::None) return;
+        POINT imagePoint{};
+        if (!clientToImage(canvas, clientX, clientY, imagePoint)) return;
+        const int dx = imagePoint.x - dragStartImage_.x;
+        const int dy = imagePoint.y - dragStartImage_.y;
+        Rect result = dragOriginal_;
+        const int minimumWidth = std::min(16, preview_.cols);
+        const int minimumHeight = std::min(16, preview_.rows);
+        if (dragEdges_ == EdgeNone) {
+            result.x = std::clamp(dragOriginal_.x + dx, 0, preview_.cols - dragOriginal_.width);
+            result.y = std::clamp(dragOriginal_.y + dy, 0, preview_.rows - dragOriginal_.height);
+        } else {
+            if (dragEdges_ & EdgeLeft) {
+                const int left = std::clamp(dragOriginal_.x + dx, 0, dragOriginal_.right() - minimumWidth);
+                result.x = left;
+                result.width = dragOriginal_.right() - left;
+            }
+            if (dragEdges_ & EdgeRight) {
+                result.width = std::clamp(dragOriginal_.width + dx, minimumWidth, preview_.cols - dragOriginal_.x);
+            }
+            if (dragEdges_ & EdgeTop) {
+                const int top = std::clamp(dragOriginal_.y + dy, 0, dragOriginal_.bottom() - minimumHeight);
+                result.y = top;
+                result.height = dragOriginal_.bottom() - top;
+            }
+            if (dragEdges_ & EdgeBottom) {
+                result.height = std::clamp(dragOriginal_.height + dy, minimumHeight, preview_.rows - dragOriginal_.y);
+            }
+        }
+        if (dragTarget_ == CanvasTarget::Viewport) setRect(viewportEdits_, result);
+        if (dragTarget_ == CanvasTarget::Track) setRect(trackEdits_, result);
+        InvalidateRect(canvas, nullptr, FALSE);
+    }
+
+    void endPreviewDrag(HWND canvas) {
+        if (GetCapture() == canvas) ReleaseCapture();
+        dragTarget_ = CanvasTarget::None;
+        dragEdges_ = EdgeNone;
+        InvalidateRect(canvas, nullptr, FALSE);
+    }
+
+    LRESULT handlePreviewMessage(HWND canvas, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(canvas, &paint);
+            paintPreview(canvas, dc);
+            EndPaint(canvas, &paint);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+            SetFocus(canvas);
+            beginPreviewDrag(canvas, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MOUSEMOVE:
+            if (GetCapture() == canvas) updatePreviewDrag(canvas, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_LBUTTONUP:
+            endPreviewDrag(canvas);
+            return 0;
+        default:
+            return DefWindowProcW(canvas, message, wParam, lParam);
+        }
+    }
+
     bool ensureSource() {
         target_ = selectedTarget();
         if (!IsWindow(target_)) {
@@ -250,26 +493,38 @@ private:
     }
 
     void capturePreview() {
+        if (capturing_) {
+            setStatus(L"Stop the current capture before recapturing a preview.");
+            return;
+        }
         target_ = selectedTarget();
         if (!IsWindow(target_)) {
             setStatus(L"Choose a valid visible top-level window first.");
             return;
         }
+        // A preview belongs to exactly one target and calibration. Do not let
+        // a failed recapture leave the previous target's image/coordinates in
+        // place, and discard any finalized session tied to that image.
+        preview_.release();
+        session_.reset();
+        InvalidateRect(previewCanvas_, nullptr, TRUE);
         source_ = createFrameSource(target_);
         sourceTarget_ = target_;
         if (!source_) {
             setStatus(L"Unable to capture the selected window.");
             return;
         }
-        for (int attempt = 0; attempt < 8 && preview_.empty(); ++attempt) {
+        cv::Mat captured;
+        for (int attempt = 0; attempt < 8 && captured.empty(); ++attempt) {
             const auto frame = source_->capture();
-            if (frame) preview_ = frame->bgra;
+            if (frame) captured = frame->bgra.clone();
             Sleep(20);
         }
-        if (preview_.empty()) {
+        if (captured.empty()) {
             setStatus(L"The capture source did not return a frame yet; try Capture preview again.");
             return;
         }
+        preview_ = std::move(captured);
         setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
         const auto detected = ScrollbarDetector::autoDetect(preview_);
         if (detected) setRect(trackEdits_, detected->track);
@@ -277,8 +532,9 @@ private:
         std::wstring message = L"Preview captured by " + source_->name() + L" (" +
             std::to_wstring(preview_.cols) + L"x" + std::to_wstring(preview_.rows) + L"). ";
         message += detected ? L"Scrollbar candidate detected; adjust fields if needed." :
-                              L"No scrollbar candidate found; set the track fields manually.";
+                               L"No scrollbar candidate found; set the track fields manually.";
         setStatus(message);
+        InvalidateRect(previewCanvas_, nullptr, TRUE);
     }
 
     void autoDetectScrollbar() {
@@ -297,12 +553,23 @@ private:
         if (capturing_) return;
         if (preview_.empty() || selectedTarget() != sourceTarget_) capturePreview();
         if (!ensureSource()) return;
+        const int calibratedWidth = preview_.cols;
+        const int calibratedHeight = preview_.rows;
         const auto frame = source_->capture();
         if (!frame) {
             setStatus(L"Could not obtain the first frame; capture a preview again.");
             return;
         }
-        preview_ = frame->bgra;
+        if ((calibratedWidth > 0 && frame->width() != calibratedWidth) ||
+            (calibratedHeight > 0 && frame->height() != calibratedHeight)) {
+            preview_ = frame->bgra.clone();
+            InvalidateRect(previewCanvas_, nullptr, TRUE);
+            session_.reset();
+            setStatus(L"The target changed size; capture a new preview and recalibrate.");
+            return;
+        }
+        preview_ = frame->bgra.clone();
+        InvalidateRect(previewCanvas_, nullptr, FALSE);
         StitchOptions options;
         options.viewport = readRect(viewportEdits_);
         options.scrollbar.track = readRect(trackEdits_);
@@ -321,12 +588,14 @@ private:
     }
 
     void stopCapture() {
-        if (!capturing_ && session_.state() != SessionState::Paused) return;
+        if (!capturing_ && session_.state() != SessionState::Paused &&
+            session_.state() != SessionState::Capturing) return;
         capturing_ = false;
         KillTimer(window_, kTimer);
         if (session_.finish()) {
-            setStatus(L"Finalized " + std::to_wstring(session_.finalImage().cols) + L"x" +
-                      std::to_wstring(session_.finalImage().rows) + L". Choose Export PNG/JPEG.");
+            setStatus(L"Finalized " + std::to_wstring(session_.outputStore().width()) + L"x" +
+                      std::to_wstring(session_.outputStore().rows()) +
+                      L" in disk-backed storage. Choose Export PNG/JPEG.");
         } else {
             setStatus(widen(session_.lastMessage()));
         }
@@ -335,7 +604,27 @@ private:
     void captureTick() {
         if (!capturing_ || !source_) return;
         const auto frame = source_->capture();
-        if (!frame) return;
+        if (!frame) {
+            if (!IsWindow(target_)) {
+                capturing_ = false;
+                KillTimer(window_, kTimer);
+                setStatus(L"The target window closed; click Stop to finalize the valid prefix.");
+            } else if (source_->width() != preview_.cols || source_->height() != preview_.rows) {
+                capturing_ = false;
+                KillTimer(window_, kTimer);
+                setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
+            }
+            // Windows Graphics Capture can have an empty frame queue between
+            // compositor updates. Treat that as a transient miss, not a
+            // failed capture.
+            return;
+        }
+        if (frame->width() != preview_.cols || frame->height() != preview_.rows) {
+            capturing_ = false;
+            KillTimer(window_, kTimer);
+            setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
+            return;
+        }
         const StitchUpdate update = session_.process(frame->bgra);
         if (update.paused) {
             capturing_ = false;
@@ -353,7 +642,7 @@ private:
 
     void exportImage() {
         if (capturing_) stopCapture();
-        if (session_.state() != SessionState::Finalized || session_.finalImage().empty()) {
+        if (!session_.hasOutput()) {
             setStatus(L"Capture and stop a session before exporting.");
             return;
         }
@@ -363,9 +652,23 @@ private:
         dialog.lpstrFilter = L"PNG image (*.png)\0*.png\0JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
         dialog.lpstrFile = filename;
         dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
+        dialog.lpstrDefExt = L"png";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
         if (!GetSaveFileNameW(&dialog)) return;
-        const ExportResult result = ImageExporter::write(session_.finalImage(), filename);
+        std::filesystem::path outputPath(filename);
+        const std::wstring extension = outputPath.extension().wstring();
+        const bool png = dialog.nFilterIndex != 2;
+        if (extension.empty()) {
+            outputPath += png ? L".png" : L".jpg";
+        } else {
+            std::wstring lower = extension;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](wchar_t character) { return static_cast<wchar_t>(std::towlower(character)); });
+            if (lower != L".png" && lower != L".jpg" && lower != L".jpeg") {
+                outputPath.replace_extension(png ? L".png" : L".jpg");
+            }
+        }
+        const ExportResult result = ImageExporter::write(session_.outputStore(), outputPath);
         if (!result.success) {
             setStatus(widen(result.message));
             return;

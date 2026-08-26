@@ -177,11 +177,14 @@ bool StitchSession::finish() {
         return false;
     }
     outputRows_ += pending_.rows - pendingStart_;
-    finalImage_ = store_.readAll();
-    store_.close(true);
-    if (finalImage_.empty()) {
+    // Keep the strip store open for streaming export. Materializing the
+    // complete result here made long captures consume hundreds of megabytes
+    // (or more) before the encoder even started.
+    finalImage_.release();
+    if (store_.rows() == 0 || store_.rows() != static_cast<std::uint64_t>(outputRows_)) {
         state_ = SessionState::Failed;
-        lastMessage_ = "unable to read the assembled image";
+        lastMessage_ = "unable to validate the assembled strip store";
+        store_.close(true);
         return false;
     }
     state_ = SessionState::Finalized;
