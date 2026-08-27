@@ -13,7 +13,9 @@ bool StitchSession::start(const cv::Mat& firstFrame, const StitchOptions& option
         return false;
     }
     options_ = options;
-    options_.viewport = options.viewport.clampTo(firstFrame.cols, firstFrame.rows);
+    const Rect selectedViewport = options.viewport.clampTo(firstFrame.cols, firstFrame.rows);
+    options_.viewport = selectedViewport;
+    int staticHeaderRows = 0;
     if (options_.maskStaticOutsideScrollbar && options_.scrollbar.enabled &&
         options_.scrollbar.track.valid()) {
         const Rect track = options_.scrollbar.track.clampTo(firstFrame.cols, firstFrame.rows);
@@ -27,6 +29,7 @@ bool StitchSession::start(const cv::Mat& firstFrame, const StitchOptions& option
         // an otherwise usable viewport.
         const int minimumUsefulHeight = std::max(32, options_.viewport.height / 5);
         if (movingHeight >= minimumUsefulHeight) {
+            staticHeaderRows = movingTop - selectedViewport.y;
             options_.viewport.y = movingTop;
             options_.viewport.height = movingHeight;
         }
@@ -36,6 +39,19 @@ bool StitchSession::start(const cv::Mat& firstFrame, const StitchOptions& option
         lastMessage_ = "unable to initialize strip storage";
         return false;
     }
+    // A fixed header provides useful context but must not be present in every
+    // registered frame. Commit the selected rows above the scrollbar track
+    // once, then stitch only the moving band below them.
+    if (staticHeaderRows > 0) {
+        const cv::Mat staticHeader = firstFrame(cv::Rect(
+            selectedViewport.x, selectedViewport.y, selectedViewport.width, staticHeaderRows));
+        if (!store_.append(staticHeader, 0, staticHeader.rows)) {
+            state_ = SessionState::Failed;
+            lastMessage_ = "unable to preserve the selected static header";
+            return false;
+        }
+    }
+    outputRows_ = staticHeaderRows;
     pending_ = firstFrame(cv::Rect(options_.viewport.x, options_.viewport.y,
                                    options_.viewport.width, options_.viewport.height)).clone();
     if (pending_.empty()) {

@@ -93,10 +93,14 @@ public:
         if (!RegisterClassExW(&klass)) return false;
         window_ = CreateWindowExW(0, klass.lpszClassName, L"Universal Scroll Stitcher",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  1040, 900, nullptr, nullptr, instance, this);
+                                  1040, 680, nullptr, nullptr, instance, this);
         if (!window_) return false;
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
+        if (previewCanvas_) {
+            ShowWindow(previewCanvas_, SW_SHOW);
+            UpdateWindow(previewCanvas_);
+        }
         return true;
     }
 
@@ -113,7 +117,7 @@ private:
     static constexpr int kMaximumJumpPercent = 95;
     static constexpr int kDefaultJumpPercent = 90;
     static constexpr int kMinimumClientWidth = 980;
-    static constexpr int kMinimumClientHeight = 820;
+    static constexpr int kMinimumClientHeight = 600;
 
     HWND window_ = nullptr;
     HINSTANCE instance_ = nullptr;
@@ -125,7 +129,6 @@ private:
     HWND targetCard_ = nullptr;
     HWND calibrationCard_ = nullptr;
     HWND statusCard_ = nullptr;
-    HWND previewCard_ = nullptr;
     HWND loggingCheckbox_ = nullptr;
     HWND openLogsButton_ = nullptr;
     HWND latestReleaseLink_ = nullptr;
@@ -268,13 +271,6 @@ private:
         case WM_SIZE:
             if (wParam != SIZE_MINIMIZED) {
                 layoutControls(static_cast<int>(LOWORD(lParam)), static_cast<int>(HIWORD(lParam)));
-                // StretchDIBits uses the current child-client size on every
-                // paint. Force a complete child repaint here so resizing the
-                // main window immediately rescales the existing preview.
-                if (previewCanvas_) {
-                    RedrawWindow(previewCanvas_, nullptr, nullptr,
-                                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-                }
             }
             return 0;
         case WM_CTLCOLORSTATIC:
@@ -290,6 +286,7 @@ private:
         case WM_DESTROY:
             KillTimer(window_, kTimer);
             if (source_) source_->stop();
+            if (previewCanvas_) DestroyWindow(previewCanvas_);
             logger_.info("app", "shutdown");
             logger_.disable();
             if (latestReleaseFont_) DeleteObject(latestReleaseFont_);
@@ -408,13 +405,26 @@ private:
                                   42, 489, 864, 36, window_, menuId(kStatus), instance_, nullptr);
         if (bodyFont_) SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
 
-        previewCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
-                                       24, 546, 900, 220, window_, nullptr, instance_, nullptr);
-        addLabel(L"Preview & calibration", 42, 560, 220);
-        addLabel(L"Drag the green viewport or orange scrollbar rectangle to fine-tune it.", 300, 560, 560);
-        previewCanvas_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"UniversalScrollStitcherPreview", nullptr,
-                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         36, 588, 876, 170, window_, nullptr, instance_, this);
+        constexpr int previewWindowWidth = 760;
+        constexpr int previewWindowHeight = 650;
+        RECT mainBounds{};
+        GetWindowRect(window_, &mainBounds);
+        MONITORINFO monitorInfo{sizeof(MONITORINFO)};
+        GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitorInfo);
+        int previewX = mainBounds.right + 12;
+        if (previewX + previewWindowWidth > monitorInfo.rcWork.right) {
+            previewX = std::max(monitorInfo.rcWork.left,
+                                mainBounds.left - previewWindowWidth - 12);
+        }
+        const int previewY = std::clamp(mainBounds.top, monitorInfo.rcWork.top,
+                                        std::max(monitorInfo.rcWork.top,
+                                                 monitorInfo.rcWork.bottom - previewWindowHeight));
+        previewCanvas_ = CreateWindowExW(
+            WS_EX_TOOLWINDOW, L"UniversalScrollStitcherPreview",
+            L"Preview & calibration - drag the green viewport or orange scrollbar",
+            WS_OVERLAPPEDWINDOW, previewX, previewY,
+            previewWindowWidth, previewWindowHeight,
+            window_, nullptr, instance_, this);
 
         loggingCheckbox_ = CreateWindowExW(0, L"BUTTON", L"Enable diagnostic logging",
                                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -441,8 +451,6 @@ private:
         const int margin = 24;
         const int contentWidth = std::max(1, width - margin * 2);
         const int footerTop = std::max(0, clientHeight - 52);
-        const int previewTop = 546;
-        const int previewHeight = std::max(170, footerTop - previewTop - 12);
         const int buttonY = 184;
         if (title_) MoveWindow(title_, margin, 20, contentWidth, 38, TRUE);
         if (subtitle_) MoveWindow(subtitle_, margin, 58, contentWidth, 24, TRUE);
@@ -471,9 +479,6 @@ private:
         }
         if (statusCard_) MoveWindow(statusCard_, margin, 422, contentWidth, 112, TRUE);
         if (status_) MoveWindow(status_, 42, 489, std::max(400, width - 84), 36, TRUE);
-        if (previewCard_) MoveWindow(previewCard_, margin, previewTop, contentWidth, previewHeight, TRUE);
-        if (previewCanvas_) MoveWindow(previewCanvas_, 36, previewTop + 42,
-                                       std::max(200, width - 72), std::max(100, previewHeight - 54), TRUE);
         if (loggingCheckbox_) MoveWindow(loggingCheckbox_, margin, footerTop + 10, 220, 28, TRUE);
         if (openLogsButton_) MoveWindow(openLogsButton_, 252, footerTop + 7, 150, 34, TRUE);
         if (latestReleaseLink_) MoveWindow(latestReleaseLink_, std::max(420, width - 500),
@@ -499,7 +504,7 @@ private:
             SetBkMode(dc, OPAQUE);
             return reinterpret_cast<LRESULT>(statusBrush_);
         }
-        if (control == targetCard_ || control == calibrationCard_ || control == statusCard_ || control == previewCard_) {
+        if (control == targetCard_ || control == calibrationCard_ || control == statusCard_) {
             SetBkMode(dc, OPAQUE);
             return reinterpret_cast<LRESULT>(cardBrush_);
         }
@@ -823,10 +828,11 @@ private:
         setRect(trackEdits_, track);
         if (!preview_.empty()) {
             // Selecting a scrollbar establishes the scrollable panel as one
-            // atomic calibration operation. This is the same content-box
-            // derivation used for the initial best candidate: the viewport is
-            // vertically bounded by the track and stops before the scrollbar.
-            Rect viewport{0, track.y, preview_.cols, track.height};
+            // atomic calibration operation. Keep the rows above its track in
+            // the green box so fixed headers are emitted once before the
+            // moving band, and stop before the scrollbar itself.
+            Rect viewport{0, 0, preview_.cols,
+                          std::clamp(track.bottom(), 16, preview_.rows)};
             if (candidate.config.side == ScrollbarSide::Right) {
                 viewport.width = std::max(16, track.x);
             } else {
@@ -1010,6 +1016,15 @@ private:
 
     LRESULT handlePreviewMessage(HWND canvas, UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
+        case WM_CLOSE:
+            ShowWindow(canvas, SW_HIDE);
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            limits->ptMinTrackSize.x = 420;
+            limits->ptMinTrackSize.y = 320;
+            return 0;
+        }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT paint{};
@@ -1031,6 +1046,9 @@ private:
         case WM_LBUTTONUP:
             endPreviewDrag(canvas);
             return 0;
+        case WM_NCDESTROY:
+            if (previewCanvas_ == canvas) previewCanvas_ = nullptr;
+            return DefWindowProcW(canvas, message, wParam, lParam);
         default:
             return DefWindowProcW(canvas, message, wParam, lParam);
         }
@@ -1152,6 +1170,7 @@ private:
             message += L"No scrollbar candidate found; set the orange track manually.";
         }
         setStatus(message);
+        ShowWindow(previewCanvas_, SW_SHOW);
         InvalidateRect(previewCanvas_, nullptr, TRUE);
     }
 

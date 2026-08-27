@@ -16,7 +16,7 @@ The stitcher combines two signals:
 
 - The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate. Full-window automatic detection checks several thin track widths, ranks neutral-gray scrollbar thumbs highly, and exposes every distinct result in a dropdown while showing only the selected match in the preview.
 - Frame-to-frame pixel registration finds the exact vertical displacement and rejects ambiguous matches.
-- The scrollbar's vertical travel range masks fixed headers and footers. Frame-to-frame motion masks also exclude fixed sidebars, toolbars, overlays, and other static pixels inside a broader content rectangle from registration and seam selection.
+- The scrollbar's vertical travel range keeps fixed chrome out of registration. Selected rows above that range are included once as a static header, while fixed rows below it are excluded. Frame-to-frame motion masks also exclude fixed sidebars, toolbars, overlays, and other static pixels inside a broader content rectangle from registration and seam selection.
 - A low-difference row inside the overlap becomes the seam.
 - Accepted strips are written to temporary disk-backed storage, avoiding an ever-growing screenshot in RAM.
 
@@ -25,8 +25,8 @@ The user always scrolls manually. The app only observes captured frames and neve
 ## Use
 
 1. Select a top-level target window. Click **Refresh** if it was opened after the stitcher.
-2. Click **Capture preview**. The preview scales to the app window, continues updating from the target at up to 60 Hz, and shows the highest-ranked scrollbar in orange. Detection covers the full target window, including scrollable panels in the middle of a game or split-pane application.
-3. If the orange rectangle is wrong, choose another entry under **Detected scrollbars** and click **Set selected**. Each entry includes its coordinates, size, detector confidence, and ranking score. Setting a candidate updates both the orange scrollbar and green content viewport together; only the selected candidate is drawn, keeping the preview uncluttered.
+2. Click **Capture preview**. A separate resizable preview window shows the target, continues updating at up to 60 Hz, and marks the highest-ranked scrollbar in orange. Detection covers the full target window, including scrollable panels in the middle of a game or split-pane application.
+3. If the orange rectangle is wrong, choose another entry under **Detected scrollbars** and click **Set selected**. Each entry includes its coordinates, size, detector confidence, and ranking score. Setting a candidate updates both the orange scrollbar and green content viewport together. The default green box includes everything above the scrollbar track so a static header is preserved once; only the selected scrollbar is drawn, keeping the preview uncluttered.
 4. Drag inside the green content or orange scrollbar rectangle to move it, or drag an edge to resize it. The content area should exclude the scrollbar itself. Use **Save template** to write both rectangles to a versioned `.ussconfig` file. Use **Load template** to restore them later; if the target dimensions changed, both rectangles are scaled to fit the current preview.
 5. Set **Maximum single-frame jump** to the largest gap the matcher may accept. The 90% default retains 10% of the viewport as visual overlap; raise it toward 95% for faster scrolling, or lower it when repetitive content needs more protection against a false match.
 6. Click **Start**, switch to the target, and manually scroll downward at a comfortable pace. The 60 Hz capture loop and deeper frame queue preserve intermediate views during short wheel bursts, while the matcher can directly recover a jump up to the selected limit. Starting mid-document is allowed; scroll back to the top first only when you want a full-page capture.

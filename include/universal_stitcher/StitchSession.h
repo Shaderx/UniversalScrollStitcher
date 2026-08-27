@@ -20,6 +20,8 @@ struct StitchOptions {
     // Fixed headers and footers must not participate in vertical
     // registration. When the scrollbar track covers only a middle band of a
     // broader viewport, use that vertical band as the effective stitch area.
+    // Rows selected above that band are preserved once as an output header;
+    // rows below it remain excluded so they are not repeated in the stitch.
     bool maskStaticOutsideScrollbar = true;
 };
 

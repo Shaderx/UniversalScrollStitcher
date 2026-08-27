@@ -431,7 +431,8 @@ void testCalibrationProfileRoundTripAndScaling() {
 void testCenteredScrollAreaMasksStaticChrome() {
     StitchOptions options;
     // Deliberately include the fixed header and footer. The scrollbar track
-    // defines the actual moving middle band and should mask both static areas.
+    // defines the moving middle band: preserve the header once for context,
+    // stitch the moving content, and keep the footer out of the result.
     options.viewport = {0, 0, 152, 160};
     options.scrollbar = {{152, 24, 8, 110}, ScrollbarSide::Right, true};
     StitchSession session;
@@ -444,11 +445,14 @@ void testCenteredScrollAreaMasksStaticChrome() {
             "centered moving content should register despite fixed outer chrome");
     require(session.finish(), "centered scroll session should finalize");
     const cv::Mat assembled = session.outputStore().readAll();
-    require(assembled.rows == 120 && assembled.cols == 152,
-            "static masking should output only the moving content band");
-    const cv::Mat expected = documentFrame(0, 152, 120);
+    require(assembled.rows == 144 && assembled.cols == 152,
+            "the output should contain one header followed by the moving content band");
+    cv::Mat expected(144, 152, CV_8UC4);
+    centeredScrollFrame(0, 26)(cv::Rect(0, 0, 152, 24))
+        .copyTo(expected(cv::Rect(0, 0, 152, 24)));
+    documentFrame(0, 152, 120).copyTo(expected(cv::Rect(0, 24, 152, 120)));
     require(cv::countNonZero(assembled.reshape(1) != expected.reshape(1)) == 0,
-            "static header and footer pixels must not appear in stitched output");
+            "the static header must appear exactly once before the stitched moving pixels");
 }
 
 void testStaticElementsInsideViewportAreMasked() {
