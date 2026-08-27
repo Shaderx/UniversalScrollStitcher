@@ -92,5 +92,3 @@ Dependencies are declared in [`vcpkg.json`](vcpkg.json). If C++/WinRT headers ar
 - Animated, parallax, rapidly changing, zoomed, or horizontally scrolling content may not stitch reliably
 - Custom scrollbars with little contrast may require manual track adjustment
 - JPEG exports taller than the Windows codec limit (~65,000 rows) are split into numbered parts; PNG stays a single file unless the capture is extraordinarily tall; PNG is preferred for UI text
-
-The repository is independent from `UmaUmaChecker` and does not link or modify it.
