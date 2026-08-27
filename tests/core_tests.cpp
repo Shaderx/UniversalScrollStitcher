@@ -1,13 +1,17 @@
+#include "universal_stitcher/CalibrationProfile.h"
 #include "universal_stitcher/ScrollbarDetector.h"
 #include "universal_stitcher/SeamFinder.h"
 #include "universal_stitcher/StitchSession.h"
 #include "universal_stitcher/VerticalShiftEstimator.h"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -97,6 +101,71 @@ cv::Mat multipleScrollbarFrame() {
     return frame;
 }
 
+cv::Mat centeredScrollFrame(int documentOffset, int thumbTop) {
+    constexpr int width = 160;
+    constexpr int height = 160;
+    constexpr int contentWidth = 152;
+    constexpr int movingTop = 24;
+    constexpr int movingHeight = 110;
+    cv::Mat frame(height, width, CV_8UC4, cv::Scalar(72, 72, 72, 255));
+    documentFrame(documentOffset, contentWidth, movingHeight)
+        .copyTo(frame(cv::Rect(0, movingTop, contentWidth, movingHeight)));
+    for (int y = movingTop; y < movingTop + movingHeight; ++y) {
+        for (int x = contentWidth; x < width; ++x) {
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(225, 225, 225, 255);
+        }
+    }
+    for (int y = thumbTop; y < thumbTop + 20 && y < movingTop + movingHeight; ++y) {
+        for (int x = contentWidth; x < width; ++x) {
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(95, 95, 95, 255);
+        }
+    }
+    return frame;
+}
+
+cv::Mat grayGameScrollbarFrame() {
+    constexpr int width = 240;
+    constexpr int height = 200;
+    cv::Mat frame(height, width, CV_8UC4, cv::Scalar(255, 255, 255, 255));
+    // Saturated controls near the edge should not outrank the neutral gray
+    // scrollbar taken from the supplied game UI.
+    for (int y = 55; y < 145; ++y) {
+        for (int x = 210; x < 224; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(40, 220, 80, 255);
+    }
+    for (int y = 30; y < 160; ++y) {
+        for (int x = 230; x < 235; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(217, 210, 211, 255);
+    }
+    for (int y = 30; y < 75; ++y) {
+        for (int x = 230; x < 235; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(140, 121, 123, 255);
+    }
+    // A neutral bottom-edge shadow resembles a short scrollbar thumb but has
+    // no long gray track.
+    for (int y = 180; y < height; ++y) {
+        for (int x = 235; x < width; ++x) frame.at<cv::Vec4b>(y, x) = cv::Vec4b(75, 75, 75, 255);
+    }
+    return frame;
+}
+
+cv::Mat staticOverlayFrame(int documentOffset, int thumbTop) {
+    cv::Mat frame = fullFrame(documentOffset, thumbTop);
+    // Fixed sidebar with vertical detail: comparing it at y+shift versus y is
+    // actively misleading unless same-position static pixels are masked.
+    for (int y = 0; y < 96; ++y) {
+        for (int x = 0; x < 52; ++x) {
+            const unsigned char value = static_cast<unsigned char>(35 + (y * 11 + x * 3) % 170);
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(value, value, value, 255);
+        }
+    }
+    // Fixed toolbar embedded inside the remaining scrolling content.
+    for (int y = 34; y < 48; ++y) {
+        for (int x = 52; x < 96; ++x) {
+            const unsigned char value = static_cast<unsigned char>(80 + (x * 5) % 100);
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(value, value, value, 255);
+        }
+    }
+    return frame;
+}
+
 void testShiftAndSeam() {
     const int shift = 13;
     const cv::Mat previous = documentFrame(0);
@@ -137,7 +206,35 @@ void testLargeWheelLikeShift() {
     // Misleading scrollbar prior: true shift is far outside the prior window.
     const ShiftEstimate estimate = VerticalShiftEstimator::estimate(previous, current, 18);
     require(estimate.accepted, "a large but overlapping wheel jump should still stitch");
-    require(estimate.shift == shift, "broad fallback should recover the true large shift");
+    require(estimate.shift == shift,
+            "broad fallback should recover the true large shift (actual=" +
+            std::to_string(estimate.shift) + ", reason=" + estimate.reason + ")");
+}
+
+void testSmoothScrollAdjacentShiftsAreOnePeak() {
+    constexpr int width = 220;
+    constexpr int viewportHeight = 160;
+    constexpr int shift = 10;
+    cv::Mat document(viewportHeight + shift, width, CV_8UC4);
+    for (int y = 0; y < document.rows; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int texture = (x * 7) % 31;
+            const unsigned char value = static_cast<unsigned char>(20 + y + texture);
+            document.at<cv::Vec4b>(y, x) = cv::Vec4b(
+                value, static_cast<unsigned char>(value + (x % 5)),
+                static_cast<unsigned char>(value + (x % 9)), 255);
+        }
+    }
+    const cv::Mat previous = document(cv::Rect(0, 0, width, viewportHeight)).clone();
+    const cv::Mat current = document(cv::Rect(0, shift, width, viewportHeight)).clone();
+    const ShiftEstimate estimate = VerticalShiftEstimator::estimate(previous, current, shift);
+    require(estimate.accepted,
+            "a high-confidence smooth scroll should not reject neighboring one-pixel shifts as ambiguity "
+            "(shift=" + std::to_string(estimate.shift) + ", confidence=" +
+            std::to_string(estimate.confidence) + ", margin=" +
+            std::to_string(estimate.margin) + ", reason=" + estimate.reason + ")");
+    require(estimate.shift == shift, "smooth scrolling should retain the exact displacement");
+    require(estimate.confidence >= 0.94F, "smooth scrolling should have strong visual confidence");
 }
 
 void testDisagreementIsRejected() {
@@ -188,6 +285,102 @@ void testMultipleScrollbarCandidates() {
     require(hasLeft && hasRight, "candidate list should preserve both scrollbar locations");
     const auto best = ScrollbarDetector::autoDetect(multipleScrollbarFrame());
     require(best.has_value(), "legacy best-candidate API should remain available");
+}
+
+void testGrayGameScrollbarRanksFirst() {
+    const auto candidates = ScrollbarDetector::autoDetectAll(grayGameScrollbarFrame());
+    require(!candidates.empty(), "gray game scrollbar should be detected");
+    const Rect& selected = candidates.front().config.track;
+    if (!(candidates.front().config.side == ScrollbarSide::Right &&
+          selected.x >= 228 && selected.x <= 232)) {
+        for (const auto& candidate : candidates) {
+            std::cerr << "candidate x=" << candidate.config.track.x
+                      << " y=" << candidate.config.track.y
+                      << " w=" << candidate.config.track.width
+                      << " h=" << candidate.config.track.height
+                      << " score=" << candidate.autoDetectionScore << '\n';
+        }
+    }
+    require(candidates.front().config.side == ScrollbarSide::Right &&
+            selected.x >= 228 && selected.x <= 232,
+            "the thin right-side gray scrollbar should outrank nearby colored controls and shadows");
+    require(selected.y >= 28 && selected.y <= 32 &&
+            selected.height >= 125 && selected.height <= 135,
+            "gray scrollbar track bounds should match its moving middle panel");
+}
+
+void testCalibrationProfileRoundTripAndScaling() {
+    CalibrationProfile original;
+    original.frameWidth = 600;
+    original.frameHeight = 1000;
+    original.content = {20, 200, 550, 600};
+    original.scrollbar = {{580, 200, 8, 600}, ScrollbarSide::Right, true};
+    require(original.valid(), "calibration profile fixture should be valid");
+
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "universal_scroll_stitcher_profile_test.ussconfig";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::string error;
+    require(saveCalibrationProfile(path, original, error),
+            "calibration profile should save: " + error);
+    const auto loaded = loadCalibrationProfile(path, error);
+    require(loaded.has_value(), "calibration profile should load: " + error);
+    require(loaded->content.x == 20 && loaded->content.y == 200 &&
+            loaded->scrollbar.track.x == 580 &&
+            loaded->scrollbar.side == ScrollbarSide::Right,
+            "calibration profile should preserve both rectangles and scrollbar side");
+
+    const CalibrationProfile scaled = loaded->scaledTo(300, 500);
+    require(scaled.valid(), "scaled calibration profile should remain valid");
+    require(scaled.content.x == 10 && scaled.content.y == 100 &&
+            scaled.content.width == 275 && scaled.content.height == 300,
+            "content rectangle should scale with the capture dimensions");
+    require(scaled.scrollbar.track.x == 290 && scaled.scrollbar.track.y == 100 &&
+            scaled.scrollbar.track.width == 4 && scaled.scrollbar.track.height == 300,
+            "scrollbar rectangle should scale with the capture dimensions");
+    std::filesystem::remove(path, ignored);
+}
+
+void testCenteredScrollAreaMasksStaticChrome() {
+    StitchOptions options;
+    // Deliberately include the fixed header and footer. The scrollbar track
+    // defines the actual moving middle band and should mask both static areas.
+    options.viewport = {0, 0, 152, 160};
+    options.scrollbar = {{152, 24, 8, 110}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(centeredScrollFrame(0, 26), options),
+            "centered scroll session should start");
+    require(session.viewport().y == 24 && session.viewport().height == 110,
+            "static header and footer should be excluded from the effective viewport");
+    const StitchUpdate update = session.process(centeredScrollFrame(10, 30));
+    require(update.accepted && update.shift == 10,
+            "centered moving content should register despite fixed outer chrome");
+    require(session.finish(), "centered scroll session should finalize");
+    const cv::Mat assembled = session.outputStore().readAll();
+    require(assembled.rows == 120 && assembled.cols == 152,
+            "static masking should output only the moving content band");
+    const cv::Mat expected = documentFrame(0, 152, 120);
+    require(cv::countNonZero(assembled.reshape(1) != expected.reshape(1)) == 0,
+            "static header and footer pixels must not appear in stitched output");
+}
+
+void testStaticElementsInsideViewportAreMasked() {
+    StitchOptions options;
+    options.viewport = {0, 0, 96, 96};
+    options.scrollbar = {{112, 0, 8, 96}, ScrollbarSide::Right, true};
+    StitchSession session;
+    require(session.start(staticOverlayFrame(0, 2), options),
+            "static-overlay session should start");
+    const StitchUpdate first = session.process(staticOverlayFrame(8, 6));
+    require(first.accepted && first.shift == 8,
+            "fixed sidebar and toolbar pixels should not prevent the first stitch");
+    const StitchUpdate second = session.process(staticOverlayFrame(16, 10));
+    require(second.accepted && second.shift == 8,
+            "motion-only seam selection should continue making forward progress");
+    require(session.finish(), "static-overlay session should finalize");
+    require(session.outputStore().rows() == 112,
+            "static masking should preserve the exact scrolling displacement");
 }
 
 void testSessionAssembly() {
@@ -372,9 +565,12 @@ void testTopOfDocumentIsRecognizedBelowChrome() {
 int main() {
     testShiftAndSeam();
     testLargeWheelLikeShift();
+    testSmoothScrollAdjacentShiftsAreOnePeak();
     testDisagreementIsRejected();
     testScrollbarDetection();
     testMultipleScrollbarCandidates();
+    testGrayGameScrollbarRanksFirst();
+    testCalibrationProfileRoundTripAndScaling();
     testTrackExtentExcludesWindowChrome();
     testTopOfDocumentIsRecognizedBelowChrome();
     testSessionAssembly();
@@ -383,6 +579,8 @@ int main() {
     testDuplicateFrameIsNotAFailure();
     testSmallUpwardJitterIsTolerated();
     testVanishedThumbIsTolerated();
+    testCenteredScrollAreaMasksStaticChrome();
+    testStaticElementsInsideViewportAreMasked();
     std::cout << "UniversalScrollStitcher core tests passed\n";
     return 0;
 }

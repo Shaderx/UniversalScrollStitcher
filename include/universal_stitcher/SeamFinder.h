@@ -17,8 +17,8 @@ public:
     [[nodiscard]] static Seam find(const cv::Mat& previousBgra,
                                    const cv::Mat& currentBgra,
                                    int shift,
-                                   int guardRows = 3);
+                                   int guardRows = 3,
+                                   int minimumCurrentRow = -1);
 };
 
 } // namespace universal_stitcher
-

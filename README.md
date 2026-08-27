@@ -2,7 +2,7 @@
 
 [![Build portable Windows release](https://github.com/Shaderx/UniversalScrollStitcher/actions/workflows/build.yml/badge.svg)](https://github.com/Shaderx/UniversalScrollStitcher/actions/workflows/build.yml)
 
-Universal Scroll Stitcher is a lightweight Windows desktop utility that turns a manually scrolled window into one continuous PNG or JPEG. It is content-agnostic: there are no templates, OCR rules, process hooks, simulated wheel events, or input injection.
+Universal Scroll Stitcher is a lightweight Windows desktop utility that turns a manually scrolled window into one continuous PNG or JPEG. It is content-agnostic: there are no page-specific image templates, OCR rules, process hooks, simulated wheel events, or input injection. Optional calibration template files only store the two user-selected rectangles and their reference frame size.
 
 ## Download
 
@@ -14,8 +14,9 @@ Windows 10 or 11 x64 is required. Some protected or hardware-overlay surfaces ca
 
 The stitcher combines two signals:
 
-- The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate.
+- The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate. Automatic ranking favors thin, neutral-gray scrollbar thumbs on a contrasting track and shows only the best match.
 - Frame-to-frame pixel registration finds the exact vertical displacement and rejects ambiguous matches.
+- The scrollbar's vertical travel range masks fixed headers and footers. Frame-to-frame motion masks also exclude fixed sidebars, toolbars, overlays, and other static pixels inside a broader content rectangle from registration and seam selection.
 - A low-difference row inside the overlap becomes the seam.
 - Accepted strips are written to temporary disk-backed storage, avoiding an ever-growing screenshot in RAM.
 
@@ -24,8 +25,8 @@ The user always scrolls manually. The app only observes captured frames and neve
 ## Use
 
 1. Select a top-level target window. Click **Refresh** if it was opened after the stitcher.
-2. Click **Capture preview**. The preview scales to the app window and highlights distinct scrollbar candidates near both edges.
-3. Click the correct numbered candidate to make it the orange selected scrollbar. The green rectangle is the content viewport. Drag inside either rectangle to move it, or drag an edge to resize it. The viewport should exclude fixed window chrome and the scrollbar.
+2. Click **Capture preview**. The preview scales to the app window, continues updating from the target at up to 30 Hz, and shows the single highest-ranked scrollbar in orange. The initial green content area uses the scrollbar's vertical track, avoiding fixed chrome above and below a centered scrolling panel.
+3. Drag inside the green content or orange scrollbar rectangle to move it, or drag an edge to resize it. The content area should exclude the scrollbar itself. Use **Save template** to write both rectangles to a versioned `.ussconfig` file. Use **Load template** to restore them later; if the target dimensions changed, both rectangles are scaled to fit the current preview.
 4. Click **Start**, switch to the target, and manually scroll downward. Prefer small mouse-wheel notches or the down arrow; large wheel bursts can jump past the visible overlap. Starting mid-document is allowed; scroll back to the top first only when you want a full-page capture.
 5. After the last content is visible, click **Stop**, then **Export PNG/JPEG**.
 

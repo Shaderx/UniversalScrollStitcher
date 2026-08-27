@@ -133,6 +133,165 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
     return best;
 }
 
+float candidateSelectionScore(const cv::Mat& bgra, const ScrollbarCandidate& candidate) {
+    const Rect track = candidate.config.track.clampTo(bgra.cols, bgra.rows);
+    const Rect thumb = candidate.observation.thumb.clampTo(bgra.cols, bgra.rows);
+    if (!track.valid() || !thumb.valid()) return 0.0F;
+
+    double thumbBlue = 0.0;
+    double thumbGreen = 0.0;
+    double thumbRed = 0.0;
+    std::uint64_t thumbPixels = 0;
+    double backgroundLuma = 0.0;
+    std::uint64_t backgroundPixels = 0;
+    for (int y = track.y; y < track.bottom(); ++y) {
+        const auto* row = bgra.ptr<cv::Vec4b>(y);
+        for (int x = track.x; x < track.right(); ++x) {
+            const bool insideThumb = x >= thumb.x && x < thumb.right() &&
+                                     y >= thumb.y && y < thumb.bottom();
+            if (insideThumb) {
+                thumbBlue += row[x][0];
+                thumbGreen += row[x][1];
+                thumbRed += row[x][2];
+                ++thumbPixels;
+            } else {
+                backgroundLuma += luma(row[x]);
+                ++backgroundPixels;
+            }
+        }
+    }
+    if (thumbPixels == 0 || backgroundPixels == 0) return candidate.observation.confidence;
+
+    const float blue = static_cast<float>(thumbBlue / thumbPixels);
+    const float green = static_cast<float>(thumbGreen / thumbPixels);
+    const float red = static_cast<float>(thumbRed / thumbPixels);
+    const float thumbLuma = 0.114F * blue + 0.587F * green + 0.299F * red;
+    const float chroma = std::max({blue, green, red}) - std::min({blue, green, red});
+    // The supplied game uses a neutral medium-gray thumb on a very light
+    // track. Low chroma is also a useful general scrollbar cue and rejects
+    // saturated list cards near the screen edge.
+    const float neutrality = 1.0F - std::clamp(chroma / 96.0F, 0.0F, 1.0F);
+    const float contrast = std::clamp(
+        std::fabs(static_cast<float>(backgroundLuma / backgroundPixels) - thumbLuma) / 128.0F,
+        0.0F, 1.0F);
+    const float averageTrackLuma = static_cast<float>(backgroundLuma / backgroundPixels);
+    // A pure-white strip plus a dark window shadow is a common false positive
+    // at the outer frame edge. The reference scrollbar has a distinct light
+    // gray track, so discount backgrounds that are effectively pure white.
+    const float whiteTrackPenalty =
+        std::clamp((averageTrackLuma - 248.0F) / 7.0F, 0.0F, 1.0F) * 0.08F;
+    // Soft color priors from the reference UI. They improve ordering without
+    // excluding different themes because contrast, geometry, and neutrality
+    // still carry most of the score.
+    const float trackTone = 1.0F -
+        std::clamp(std::fabs(averageTrackLuma - 214.0F) / 42.0F, 0.0F, 1.0F);
+    const float thumbTone = 1.0F -
+        std::clamp(std::fabs(thumbLuma - 128.0F) / 80.0F, 0.0F, 1.0F);
+    const float edgeDistance = candidate.config.side == ScrollbarSide::Right
+        ? static_cast<float>(bgra.cols - track.right()) / std::max(1, bgra.cols)
+        : static_cast<float>(track.x) / std::max(1, bgra.cols);
+    const float edgeProximity = 1.0F - std::clamp(edgeDistance * 8.0F, 0.0F, 1.0F);
+    const float trackCoverage = std::clamp(
+        static_cast<float>(track.height) / std::max(1.0F, bgra.rows * 0.45F), 0.0F, 1.0F);
+    const int insetThreshold = std::max(2, bgra.rows / 100);
+    const float interiorTrack = track.y >= insetThreshold &&
+                                bgra.rows - track.bottom() >= insetThreshold ? 1.0F : 0.0F;
+    const float conventionalSide = candidate.config.side == ScrollbarSide::Right ? 0.05F : 0.0F;
+    return std::clamp(candidate.observation.confidence * 0.28F + neutrality * 0.15F +
+                      contrast * 0.12F + edgeProximity * 0.10F + trackCoverage * 0.12F +
+                      trackTone * 0.10F + thumbTone * 0.08F + conventionalSide -
+                      whiteTrackPenalty + interiorTrack * 0.08F,
+                      0.0F, 1.0F);
+}
+
+void collectNeutralGrayCandidates(const cv::Mat& bgra, int candidateWidth,
+                                  int firstX, int lastX, ScrollbarSide side,
+                                  std::vector<ScrollbarCandidate>& candidates) {
+    const int minimumThumbHeight = std::max(4, std::min(24, bgra.rows / 100));
+    const int maximumThumbHeight = static_cast<int>(bgra.rows * 0.60F);
+    for (int x = firstX; x <= lastX; ++x) {
+        std::vector<float> rowLuma(static_cast<std::size_t>(bgra.rows));
+        std::vector<float> rowChroma(static_cast<std::size_t>(bgra.rows));
+        for (int y = 0; y < bgra.rows; ++y) {
+            const auto* row = bgra.ptr<cv::Vec4b>(y);
+            float blue = 0.0F;
+            float green = 0.0F;
+            float red = 0.0F;
+            for (int column = x; column < x + candidateWidth; ++column) {
+                blue += row[column][0];
+                green += row[column][1];
+                red += row[column][2];
+            }
+            blue /= candidateWidth;
+            green /= candidateWidth;
+            red /= candidateWidth;
+            rowLuma[static_cast<std::size_t>(y)] =
+                0.114F * blue + 0.587F * green + 0.299F * red;
+            rowChroma[static_cast<std::size_t>(y)] =
+                std::max({blue, green, red}) - std::min({blue, green, red});
+        }
+
+        auto isThumbRow = [&](int y) {
+            const float value = rowLuma[static_cast<std::size_t>(y)];
+            return rowChroma[static_cast<std::size_t>(y)] <= 36.0F &&
+                   value >= 45.0F && value <= 195.0F;
+        };
+        int runStart = -1;
+        for (int y = 0; y <= bgra.rows; ++y) {
+            const bool active = y < bgra.rows && isThumbRow(y);
+            if (active && runStart < 0) runStart = y;
+            if (active || runStart < 0) continue;
+            const int runEnd = y;
+            const int completedStart = runStart;
+            runStart = -1;
+            const int thumbHeight = runEnd - completedStart;
+            if (thumbHeight < minimumThumbHeight || thumbHeight > maximumThumbHeight) continue;
+
+            float thumbLuma = 0.0F;
+            for (int row = completedStart; row < runEnd; ++row) {
+                thumbLuma += rowLuma[static_cast<std::size_t>(row)];
+            }
+            thumbLuma /= thumbHeight;
+
+            std::vector<float> nearbyTrackRows;
+            const int probe = std::clamp(bgra.rows / 40, 12, 32);
+            const int probeTop = std::max(0, completedStart - probe);
+            const int probeBottom = std::min(bgra.rows, runEnd + probe);
+            for (int row = probeTop; row < probeBottom; ++row) {
+                if (row >= completedStart && row < runEnd) continue;
+                const float value = rowLuma[static_cast<std::size_t>(row)];
+                if (rowChroma[static_cast<std::size_t>(row)] <= 30.0F &&
+                    value >= thumbLuma + 25.0F && value <= 246.0F) {
+                    nearbyTrackRows.push_back(value);
+                }
+            }
+            if (nearbyTrackRows.size() < 3) continue;
+            const float trackLuma = median(std::move(nearbyTrackRows));
+            const float contrast = trackLuma - thumbLuma;
+            if (contrast < 28.0F) continue;
+
+            auto isTrackRow = [&](int row) {
+                return rowChroma[static_cast<std::size_t>(row)] <= 38.0F &&
+                       std::fabs(rowLuma[static_cast<std::size_t>(row)] - trackLuma) <= 22.0F;
+            };
+            int trackTop = completedStart;
+            int trackBottom = runEnd;
+            while (trackTop > 0 && (isThumbRow(trackTop - 1) || isTrackRow(trackTop - 1))) --trackTop;
+            while (trackBottom < bgra.rows &&
+                   (isThumbRow(trackBottom) || isTrackRow(trackBottom))) ++trackBottom;
+            const int trackHeight = trackBottom - trackTop;
+            if (trackHeight < std::max(64, thumbHeight + std::max(8, thumbHeight / 3))) continue;
+
+            ScrollbarCandidate candidate{
+                {{x, trackTop, candidateWidth, trackHeight}, side, true},
+                {true, {x, completedStart, candidateWidth, thumbHeight},
+                 std::clamp(0.55F + contrast / 220.0F, 0.0F, 1.0F)}};
+            candidate.autoDetectionScore = candidateSelectionScore(bgra, candidate);
+            candidates.push_back(candidate);
+        }
+    }
+}
+
 } // namespace
 
 std::optional<ScrollbarConfig> ScrollbarDetector::autoDetect(const cv::Mat& bgra) {
@@ -145,7 +304,10 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
     std::vector<ScrollbarCandidate> candidates;
     if (bgra.empty() || bgra.type() != CV_8UC4 || bgra.cols < 32 || bgra.rows < 64) return candidates;
 
-    const int candidateWidth = std::clamp(static_cast<int>(std::round(bgra.cols * 0.025)), 8, 28);
+    // Modern overlay/game scrollbars are often only 5-8 physical pixels wide.
+    // A strip around 2.5% of the window averaged the supplied gray thumb into
+    // adjacent colorful content and promoted unrelated bottom-edge controls.
+    const int candidateWidth = std::clamp(static_cast<int>(std::round(bgra.cols * 0.012)), 5, 16);
     const int searchWidth = std::max(candidateWidth + 2, static_cast<int>(std::round(bgra.cols * 0.12)));
 
     auto collect = [&](int firstX, int lastX, ScrollbarSide side) {
@@ -159,17 +321,30 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
             // title bar makes a document that is at the top look scrolled.
             const Rect track{strip.x, run.trackTop, strip.width, run.trackBottom - run.trackTop};
             if (!track.valid()) continue;
-            candidates.push_back({
+            ScrollbarCandidate candidate{
                 {track, side, true},
-                {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence}});
+                {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence}};
+            candidate.autoDetectionScore = candidateSelectionScore(bgra, candidate);
+            candidates.push_back(candidate);
         }
     };
 
     collect(0, searchWidth - candidateWidth, ScrollbarSide::Left);
     collect(bgra.cols - searchWidth, bgra.cols - candidateWidth, ScrollbarSide::Right);
+    // Also look explicitly for a neutral gray thumb on a lighter neutral
+    // track. This catches thin game scrollbars whose track itself contrasts
+    // with the surrounding white UI and would otherwise merge into one long
+    // generic luminance run.
+    collectNeutralGrayCandidates(bgra, candidateWidth, 0, searchWidth - candidateWidth,
+                                 ScrollbarSide::Left, candidates);
+    collectNeutralGrayCandidates(bgra, candidateWidth, bgra.cols - searchWidth,
+                                 bgra.cols - candidateWidth, ScrollbarSide::Right, candidates);
 
     std::sort(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& left,
                                                        const ScrollbarCandidate& right) {
+        if (std::fabs(left.autoDetectionScore - right.autoDetectionScore) > 0.001F) {
+            return left.autoDetectionScore > right.autoDetectionScore;
+        }
         if (std::fabs(left.observation.confidence - right.observation.confidence) > 0.001F) {
             return left.observation.confidence > right.observation.confidence;
         }
@@ -194,7 +369,7 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
         const int center = candidate.config.track.x + candidate.config.track.width / 2;
         const bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const ScrollbarCandidate& existing) {
             const int existingCenter = existing.config.track.x + existing.config.track.width / 2;
-            return std::abs(center - existingCenter) <= candidateWidth;
+            return std::abs(center - existingCenter) <= candidateWidth * 2;
         });
         if (!duplicate) distinct.push_back(candidate);
         if (distinct.size() == kMaximumCandidates) break;

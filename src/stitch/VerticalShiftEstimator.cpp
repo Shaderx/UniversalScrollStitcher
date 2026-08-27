@@ -19,6 +19,15 @@ struct Candidate {
 cv::Mat registrationImage(const cv::Mat& bgra) {
     cv::Mat gray;
     cv::cvtColor(bgra, gray, cv::COLOR_BGRA2GRAY);
+    // Preserve every vertical row for exact shift estimation, but cap the
+    // horizontal working set. Full-width 1920px correlation blocked the UI
+    // thread for 50-250 ms per frame while providing little extra vertical
+    // registration information.
+    constexpr int kMaximumRegistrationWidth = 480;
+    if (gray.cols > kMaximumRegistrationWidth) {
+        cv::resize(gray, gray, cv::Size(kMaximumRegistrationWidth, gray.rows),
+                   0.0, 0.0, cv::INTER_AREA);
+    }
 
     cv::Mat gx, gy, magnitude, edges;
     cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
@@ -31,45 +40,70 @@ cv::Mat registrationImage(const cv::Mat& bgra) {
     return result;
 }
 
+cv::Mat motionMask(const cv::Mat& previous, const cv::Mat& current) {
+    cv::Mat difference;
+    cv::absdiff(previous, current, difference);
+    cv::Mat mask;
+    cv::threshold(difference, mask, 3.0, 255.0, cv::THRESH_BINARY);
+    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+    cv::dilate(mask, mask, kernel);
+    const int minimumActive = std::max(64, static_cast<int>(mask.total() / 100));
+    if (cv::countNonZero(mask) < minimumActive) return {};
+    return mask;
+}
+
 float scoreBand(const cv::Mat& previous, const cv::Mat& current, int shift,
-                int x, int y, int width, int height) {
-    if (width <= 0 || height <= 0) return 0.0F;
+                const cv::Mat& activity, int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0) return -1.0F;
     const cv::Mat oldRoi = previous(cv::Rect(x, y + shift, width, height));
     const cv::Mat newRoi = current(cv::Rect(x, y, width, height));
     cv::Mat difference;
     cv::absdiff(oldRoi, newRoi, difference);
-    const double meanDifference = cv::mean(difference)[0];
+    double meanDifference = 0.0;
+    if (!activity.empty()) {
+        const cv::Mat oldActivity = activity(cv::Rect(x, y + shift, width, height));
+        const cv::Mat newActivity = activity(cv::Rect(x, y, width, height));
+        cv::Mat combinedActivity;
+        cv::bitwise_and(oldActivity, newActivity, combinedActivity);
+        const int activePixels = cv::countNonZero(combinedActivity);
+        const int minimumActive = std::max(32, width * height / 100);
+        if (activePixels < minimumActive) return -1.0F;
+        meanDifference = cv::mean(difference, combinedActivity)[0];
+    } else {
+        meanDifference = cv::mean(difference)[0];
+    }
     return std::clamp(1.0F - static_cast<float>(meanDifference / 255.0), 0.0F, 1.0F);
 }
 
 float scoreShift(const cv::Mat& previous, const cv::Mat& current, int shift,
-                 int marginX, int comparisonWidth, int height, float minimumOverlapRatio) {
+                 const cv::Mat& activity, int marginX, int comparisonWidth,
+                 int height, float minimumOverlapRatio) {
     const int overlap = height - shift;
     if (overlap < static_cast<int>(height * minimumOverlapRatio)) return -1.0F;
 
     const int bandHeight = std::max(8, overlap / 4);
-    float scores[4]{};
+    float scoreSum = 0.0F;
+    float minimum = 1.0F;
     int bandCount = 0;
     for (int band = 0; band < 4; ++band) {
         const int y = band == 3 ? std::max(0, overlap - bandHeight) : band * overlap / 4;
         const int availableHeight = std::min(bandHeight, overlap - y);
-        scores[band] = scoreBand(previous, current, shift, marginX, y, comparisonWidth, availableHeight);
-        if (availableHeight > 0) ++bandCount;
+        const float score = scoreBand(previous, current, shift, activity, marginX, y,
+                                      comparisonWidth, availableHeight);
+        if (score < 0.0F) continue;
+        scoreSum += score;
+        minimum = std::min(minimum, score);
+        ++bandCount;
     }
     if (bandCount == 0) return -1.0F;
-    float mean = 0.0F;
-    float minimum = 1.0F;
-    for (float score : scores) {
-        mean += score;
-        minimum = std::min(minimum, score);
-    }
-    mean /= 4.0F;
+    const float mean = scoreSum / bandCount;
     return mean * 0.72F + minimum * 0.28F;
 }
 
 std::vector<Candidate> collectCandidates(const cv::Mat& previous, const cv::Mat& current,
                                          int minimumShift, int maximumShift, int marginX,
-                                         int comparisonWidth, int height,
+                                         int comparisonWidth, int height, const cv::Mat& activity,
                                          float minimumOverlapRatio, int preferredShift = 0) {
     std::vector<Candidate> candidates;
     if (maximumShift < minimumShift) return candidates;
@@ -83,7 +117,7 @@ std::vector<Candidate> collectCandidates(const cv::Mat& previous, const cv::Mat&
 
     auto consider = [&](int shift) {
         if (shift < minimumShift || shift > maximumShift) return;
-        const float score = scoreShift(previous, current, shift, marginX, comparisonWidth,
+        const float score = scoreShift(previous, current, shift, activity, marginX, comparisonWidth,
                                        height, minimumOverlapRatio);
         if (score < 0.0F) return;
         candidates.push_back({shift, score, score});
@@ -112,7 +146,7 @@ std::vector<Candidate> collectCandidates(const cv::Mat& previous, const cv::Mat&
     auto refineAround = [&](int center) {
         for (int shift = std::max(minimumShift, center - stride);
              shift <= std::min(maximumShift, center + stride); ++shift) {
-            const float score = scoreShift(previous, current, shift, marginX, comparisonWidth,
+            const float score = scoreShift(previous, current, shift, activity, marginX, comparisonWidth,
                                            height, minimumOverlapRatio);
             if (score < 0.0F) continue;
             refined.push_back({shift, score, score});
@@ -155,20 +189,44 @@ ShiftEstimate finalizeEstimate(std::vector<Candidate> candidates, int expectedSh
         best = nearest;
     }
 
-    float second = 0.0F;
+    float adjacentSecond = 0.0F;
+    bool hasAdjacentCompetitor = false;
     for (const Candidate& candidate : candidates) {
         if (candidate.shift == best.shift) continue;
-        second = candidate.score;
+        adjacentSecond = candidate.score;
+        hasAdjacentCompetitor = true;
+        break;
+    }
+
+    // Adjacent integer shifts describe the same correlation peak. They can be
+    // ignored only when the high-confidence peak also closely agrees with the
+    // scrollbar; broad visual-only searches retain the stricter ambiguity
+    // check so a distant alias cannot become a false stitch.
+    constexpr int kSamePeakRadius = 2;
+    float distantSecond = 0.0F;
+    bool hasDistantCompetitor = false;
+    for (const Candidate& candidate : candidates) {
+        if (std::abs(candidate.shift - best.shift) <= kSamePeakRadius) continue;
+        distantSecond = candidate.score;
+        hasDistantCompetitor = true;
         break;
     }
     result.shift = best.shift;
     result.confidence = best.score;
-    result.margin = best.score - second;
     if (best.score < options.minimumConfidence) {
         result.reason = "visual overlap confidence is too low";
         return result;
     }
-    if (result.margin < options.minimumMargin && candidates.size() > 1) {
+    const int strongPriorTolerance = expectedShift > 0
+        ? std::max(3, static_cast<int>(std::lround(expectedShift * 0.20F)))
+        : 0;
+    const bool strongPriorAgreement = enforcePrior && expectedShift > 0 &&
+        best.score >= 0.94F && std::abs(best.shift - expectedShift) <= strongPriorTolerance;
+    const float second = strongPriorAgreement ? distantSecond : adjacentSecond;
+    const bool hasCompetingPeak = strongPriorAgreement
+        ? hasDistantCompetitor : hasAdjacentCompetitor;
+    result.margin = best.score - second;
+    if (result.margin < options.minimumMargin && hasCompetingPeak && !strongPriorAgreement) {
         result.reason = "visual overlap is ambiguous";
         return result;
     }
@@ -198,9 +256,9 @@ ShiftEstimate VerticalShiftEstimator::estimate(const cv::Mat& previousBgra,
         return result;
     }
 
-    const int width = previousBgra.cols;
+    const int inputWidth = previousBgra.cols;
     const int height = previousBgra.rows;
-    if (width < 16 || height < 32) {
+    if (inputWidth < 16 || height < 32) {
         result.reason = "viewport is too small for registration";
         return result;
     }
@@ -208,15 +266,17 @@ ShiftEstimate VerticalShiftEstimator::estimate(const cv::Mat& previousBgra,
 
     const cv::Mat previous = registrationImage(previousBgra);
     const cv::Mat current = registrationImage(currentBgra);
+    const cv::Mat activity = motionMask(previous, current);
+    const int width = previous.cols;
     const int marginX = std::clamp(width / 20, 2, width / 4);
     const int comparisonWidth = width - marginX * 2;
     // Mouse-wheel notches often move most of a viewport between samples.
     // Keep a thin overlap band so registration still has something to lock onto.
     const int broadMaximum = std::max(1, static_cast<int>(height * (1.0F - options.minimumOverlapRatio)));
 
-    const Candidate duplicate{0, scoreBand(previous, current, 0, marginX, 0,
+    const Candidate duplicate{0, scoreBand(previous, current, 0, {}, marginX, 0,
                                            comparisonWidth, height), 0.0F};
-    if (duplicate.score >= 0.985F) {
+    if (duplicate.score >= 0.985F && activity.empty()) {
         result.duplicate = true;
         result.confidence = duplicate.score;
         result.reason = "frames are duplicates";
@@ -225,7 +285,7 @@ ShiftEstimate VerticalShiftEstimator::estimate(const cv::Mat& previousBgra,
 
     auto runSearch = [&](int minimumShift, int maximumShift, bool enforcePrior) {
         auto candidates = collectCandidates(previous, current, minimumShift, maximumShift,
-                                            marginX, comparisonWidth, height,
+                                            marginX, comparisonWidth, height, activity,
                                             options.minimumOverlapRatio, result.expectedShift);
         ShiftEstimate estimate = finalizeEstimate(std::move(candidates), result.expectedShift,
                                                   options, enforcePrior);
@@ -248,7 +308,7 @@ ShiftEstimate VerticalShiftEstimator::estimate(const cv::Mat& previousBgra,
         broadOptions.minimumMargin = std::max(options.minimumMargin, 0.035F);
         broadOptions.minimumConfidence = std::max(options.minimumConfidence, 0.86F);
         auto candidates = collectCandidates(previous, current, 1, broadMaximum,
-                                            marginX, comparisonWidth, height,
+                                            marginX, comparisonWidth, height, activity,
                                             options.minimumOverlapRatio, result.expectedShift);
         ShiftEstimate broad = finalizeEstimate(std::move(candidates), result.expectedShift,
                                                broadOptions, false);

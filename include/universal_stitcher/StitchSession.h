@@ -17,6 +17,10 @@ struct StitchOptions {
     Rect viewport;
     ScrollbarConfig scrollbar;
     ShiftEstimatorOptions estimator;
+    // Fixed headers and footers must not participate in vertical
+    // registration. When the scrollbar track covers only a middle band of a
+    // broader viewport, use that vertical band as the effective stitch area.
+    bool maskStaticOutsideScrollbar = true;
 };
 
 struct StitchUpdate {
@@ -33,6 +37,7 @@ struct StitchUpdate {
     int expectedShift = 0;
     int consecutiveRejections = 0;
     float confidence = 0.0F;
+    float margin = 0.0F;
     float scrollbarConfidence = 0.0F;
     std::string message;
 };

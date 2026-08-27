@@ -14,6 +14,23 @@ bool StitchSession::start(const cv::Mat& firstFrame, const StitchOptions& option
     }
     options_ = options;
     options_.viewport = options.viewport.clampTo(firstFrame.cols, firstFrame.rows);
+    if (options_.maskStaticOutsideScrollbar && options_.scrollbar.enabled &&
+        options_.scrollbar.track.valid()) {
+        const Rect track = options_.scrollbar.track.clampTo(firstFrame.cols, firstFrame.rows);
+        const int movingTop = std::max(options_.viewport.y, track.y);
+        const int movingBottom = std::min(options_.viewport.bottom(), track.bottom());
+        const int movingHeight = movingBottom - movingTop;
+        // A scrollbar track describes the vertical travel of the moving
+        // content. Restricting registration and output to that band masks
+        // fixed game chrome above and below a centered scrolling panel. Keep
+        // a conservative lower bound so a bad tiny manual track cannot erase
+        // an otherwise usable viewport.
+        const int minimumUsefulHeight = std::max(32, options_.viewport.height / 5);
+        if (movingHeight >= minimumUsefulHeight) {
+            options_.viewport.y = movingTop;
+            options_.viewport.height = movingHeight;
+        }
+    }
     if (!options_.viewport.valid() || !store_.open(options_.viewport.width)) {
         state_ = SessionState::Failed;
         lastMessage_ = "unable to initialize strip storage";
@@ -137,6 +154,7 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
         pending_, current, expected, options_.estimator);
     update.shift = estimate.shift;
     update.confidence = estimate.confidence;
+    update.margin = estimate.margin;
 
     // A rejected frame is not a failed session. The pending frame and the
     // accepted scrollbar baseline are both left untouched, so the overlap
@@ -166,7 +184,8 @@ StitchUpdate StitchSession::process(const cv::Mat& frame) {
     }
     if (!estimate.accepted) return reject(estimate.reason);
 
-    const Seam seam = SeamFinder::find(pending_, current, estimate.shift);
+    const int minimumSeamRow = std::max(1, pendingStart_ - estimate.shift + 1);
+    const Seam seam = SeamFinder::find(pending_, current, estimate.shift, 3, minimumSeamRow);
     const int commitEnd = estimate.shift + seam.currentRow;
     if (!seam.valid || commitEnd <= pendingStart_ || commitEnd > pending_.rows) {
         return reject("the seam made no forward progress");

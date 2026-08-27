@@ -27,15 +27,21 @@ struct ScrollbarObservation {
 struct ScrollbarCandidate {
     ScrollbarConfig config;
     ScrollbarObservation observation;
+    // Ranking combines motion-thumb contrast, neutral scrollbar color, edge
+    // proximity, and the detector's run confidence. It is only used for
+    // choosing the single automatic result.
+    float autoDetectionScore = 0.0F;
 };
 
-// This detector deliberately has no theme, game, or color template. It looks
-// for a compact, persistent contrast run in a user-supplied track rectangle.
+// The detector looks for a compact contrast run in a user-supplied track
+// rectangle. Automatic ranking also favors the low-chroma gray-on-light
+// appearance used by standard and game scrollbars without requiring an exact
+// hard-coded color.
 class ScrollbarDetector final {
 public:
-    // Returns distinct candidates ordered by confidence. Multiple candidates
-    // are kept so the calibration UI can show them all and let the user pick
-    // the correct scrollbar for nested or side-by-side scrolling views.
+    // Returns distinct candidates ordered by automatic selection quality.
+    // The GUI consumes only the first result; the full list remains available
+    // for diagnostics and library callers.
     [[nodiscard]] static std::vector<ScrollbarCandidate> autoDetectAll(const cv::Mat& bgra);
     [[nodiscard]] static std::optional<ScrollbarConfig> autoDetect(const cv::Mat& bgra);
     [[nodiscard]] static ScrollbarObservation detect(const cv::Mat& bgra,

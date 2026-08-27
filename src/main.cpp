@@ -1,4 +1,5 @@
 #include "universal_stitcher/ImageExporter.h"
+#include "universal_stitcher/CalibrationProfile.h"
 #include "universal_stitcher/DiagnosticLogger.h"
 #include "universal_stitcher/StitchSession.h"
 #include "universal_stitcher/WindowCapture.h"
@@ -41,6 +42,8 @@ enum ControlId : int {
     kStart = 104,
     kStop = 105,
     kExport = 106,
+    kSaveTemplate = 107,
+    kLoadTemplate = 108,
     kViewportX = 120,
     kViewportY = 121,
     kViewportWidth = 122,
@@ -98,7 +101,9 @@ private:
     // ~30 Hz is enough to catch mouse-wheel notches while staying responsive on
     // the UI thread. Arrow-key scrolling was already fine at 10 Hz.
     static constexpr UINT kTimerPeriodMs = 33;
-    static constexpr int kMaximumFramesPerTick = 6;
+    // Bound work per UI tick so a burst cannot starve preview painting. The
+    // WGC pool retains four frames and the next tick continues draining it.
+    static constexpr int kMaximumFramesPerTick = 3;
     static constexpr int kMinimumClientWidth = 980;
     static constexpr int kMinimumClientHeight = 760;
 
@@ -131,6 +136,8 @@ private:
     cv::Mat preview_;
     std::vector<ScrollbarCandidate> scrollbarCandidates_;
     std::optional<std::size_t> selectedScrollbarCandidate_;
+    std::optional<CalibrationProfile> pendingCalibrationProfile_;
+    ScrollbarSide scrollbarSide_ = ScrollbarSide::Right;
     StitchSession session_;
     DiagnosticLogger logger_;
     bool capturing_ = false;
@@ -202,8 +209,13 @@ private:
                 const int id = LOWORD(wParam);
                 if (!updatingCalibrationEdits_ && id >= kTrackX && id <= kTrackHeight) {
                     selectedScrollbarCandidate_.reset();
+                    const Rect track = readRect(trackEdits_);
+                    if (!preview_.empty() && track.valid()) {
+                        scrollbarSide_ = track.x + track.width / 2 < preview_.cols / 2
+                            ? ScrollbarSide::Left : ScrollbarSide::Right;
+                    }
                     logger_.info("calibration", "manual scrollbar track edit changed to{" +
-                                 rectDescription(readRect(trackEdits_)) + "}");
+                                 rectDescription(track) + "}");
                 } else if (!updatingCalibrationEdits_ && id >= kViewportX && id <= kViewportHeight) {
                     logger_.info("calibration", "manual viewport edit changed to{" +
                                  rectDescription(readRect(viewportEdits_)) + "}");
@@ -336,6 +348,8 @@ private:
         trackEdits_[1] = addEdit(kTrackY, 702, 296, 64);
         trackEdits_[2] = addEdit(kTrackWidth, 774, 296, 64);
         trackEdits_[3] = addEdit(kTrackHeight, 846, 296, 64);
+        addButton(L"Save template", kSaveTemplate, 630, 326, 132);
+        addButton(L"Load template", kLoadTemplate, 774, 326, 132);
 
         statusCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
                                       24, 376, 900, 112, window_, nullptr, instance_, nullptr);
@@ -396,6 +410,12 @@ private:
         if (HWND stop = GetDlgItem(window_, kStop)) MoveWindow(stop, 524, buttonY, 100, 34, TRUE);
         if (HWND exportButton = GetDlgItem(window_, kExport)) MoveWindow(exportButton, 636, buttonY, 164, 34, TRUE);
         if (calibrationCard_) MoveWindow(calibrationCard_, margin, 232, contentWidth, 130, TRUE);
+        if (HWND saveTemplate = GetDlgItem(window_, kSaveTemplate)) {
+            MoveWindow(saveTemplate, 630, 326, 132, 30, TRUE);
+        }
+        if (HWND loadTemplate = GetDlgItem(window_, kLoadTemplate)) {
+            MoveWindow(loadTemplate, 774, 326, 132, 30, TRUE);
+        }
         if (statusCard_) MoveWindow(statusCard_, margin, 376, contentWidth, 112, TRUE);
         if (status_) MoveWindow(status_, 42, 443, std::max(400, width - 84), 36, TRUE);
         if (previewCard_) MoveWindow(previewCard_, margin, previewTop, contentWidth, previewHeight, TRUE);
@@ -589,6 +609,35 @@ private:
         updatingCalibrationEdits_ = previousUpdating;
     }
 
+    bool applyCalibrationProfile(const CalibrationProfile& saved, bool announce) {
+        if (preview_.empty()) return false;
+        const CalibrationProfile profile = saved.scaledTo(preview_.cols, preview_.rows);
+        if (!profile.valid()) {
+            setStatus(L"The template could not be scaled to the current preview size.");
+            return false;
+        }
+        scrollbarCandidates_.clear();
+        selectedScrollbarCandidate_.reset();
+        scrollbarSide_ = profile.scrollbar.side;
+        setRect(viewportEdits_, profile.content);
+        setRect(trackEdits_, profile.scrollbar.track);
+        logger_.info("calibration", "template applied reference=" +
+                     std::to_string(saved.frameWidth) + "x" + std::to_string(saved.frameHeight) +
+                     " current=" + std::to_string(profile.frameWidth) + "x" +
+                     std::to_string(profile.frameHeight) + " content{" +
+                     rectDescription(profile.content) + "} scrollbar{" +
+                     rectDescription(profile.scrollbar.track) + "}");
+        InvalidateRect(previewCanvas_, nullptr, FALSE);
+        if (announce) {
+            const bool scaled = saved.frameWidth != profile.frameWidth ||
+                                saved.frameHeight != profile.frameHeight;
+            setStatus(scaled
+                ? L"Template loaded and scaled to the current preview. The green content and orange scrollbar areas were restored."
+                : L"Template loaded. The green content and orange scrollbar areas were restored.");
+        }
+        return true;
+    }
+
     struct DisplayTransform {
         RECT destination{};
         double scale = 1.0;
@@ -649,6 +698,7 @@ private:
         if (index >= scrollbarCandidates_.size()) return;
         selectedScrollbarCandidate_ = index;
         const auto& candidate = scrollbarCandidates_[index];
+        scrollbarSide_ = candidate.config.side;
         logger_.info("calibration", "selected scrollbar candidate #" + std::to_string(index + 1) +
                      " track{" + rectDescription(candidate.config.track) + "} thumb{" +
                      rectDescription(candidate.observation.thumb) + "} confidence=" +
@@ -658,8 +708,7 @@ private:
         if (announce) {
             const int confidence = static_cast<int>(std::lround(
                 scrollbarCandidates_[index].observation.confidence * 100.0F));
-            setStatus(L"Selected scrollbar candidate #" + std::to_wstring(index + 1) +
-                      L" (confidence " + std::to_wstring(confidence) +
+            setStatus(L"Selected scrollbar (confidence " + std::to_wstring(confidence) +
                       L"%). Drag the orange rectangle to fine-tune it if needed.");
         }
     }
@@ -754,7 +803,7 @@ private:
         SetTextColor(dc, RGB(255, 170, 30));
         RECT trackLabel{trackRect.left + 4, trackRect.top + 3, trackRect.right + 150, trackRect.top + 22};
         const std::wstring trackText = selectedScrollbarCandidate_
-            ? L"SCROLLBAR #" + std::to_wstring(*selectedScrollbarCandidate_ + 1) + L" SELECTED"
+            ? L"SCROLLBAR SELECTED"
             : L"SCROLLBAR TRACK (MANUAL)";
         DrawTextW(dc, trackText.c_str(), -1, &trackLabel,
                   DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -936,25 +985,33 @@ private:
             return;
         }
         preview_ = std::move(captured);
+        // Once a preview source exists, keep the canvas live even before and
+        // after stitching. Static WGC targets simply yield no queued frame,
+        // so this timer is inexpensive while nothing changes.
+        SetTimer(window_, kTimer, kTimerPeriodMs, nullptr);
         logger_.info("preview", "preview succeeded source=" + narrow(source_->name()) +
                      " dimensions=" + std::to_string(preview_.cols) + "x" + std::to_string(preview_.rows));
-        scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
+        const auto detectedCandidates = ScrollbarDetector::autoDetectAll(preview_);
         logger_.info("calibration", "auto-detected scrollbar candidates=" +
-                     std::to_string(scrollbarCandidates_.size()));
-        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
-            const auto& candidate = scrollbarCandidates_[index];
+                     std::to_string(detectedCandidates.size()));
+        for (std::size_t index = 0; index < detectedCandidates.size(); ++index) {
+            const auto& candidate = detectedCandidates[index];
             logger_.info("calibration", "candidate #" + std::to_string(index + 1) +
                          " track{" + rectDescription(candidate.config.track) + "} thumb{" +
                          rectDescription(candidate.observation.thumb) + "} confidence=" +
-                         std::to_string(candidate.observation.confidence));
+                         std::to_string(candidate.observation.confidence) + " selection_score=" +
+                         std::to_string(candidate.autoDetectionScore));
         }
+        // Keep the preview unambiguous: automatic ranking selects exactly one
+        // scrollbar. The full list above is diagnostics-only.
+        if (!detectedCandidates.empty()) scrollbarCandidates_.push_back(detectedCandidates.front());
         if (!scrollbarCandidates_.empty()) {
             selectScrollbarCandidate(0, false);
             // The content viewport must exclude the scrollbar strip; baking
             // the thumb into every strip leaves a jumping column through the
             // entire capture.
-            Rect viewport{0, 0, preview_.cols, preview_.rows};
             const Rect& track = scrollbarCandidates_.front().config.track;
+            Rect viewport{0, track.y, preview_.cols, track.height};
             if (track.x + track.width / 2 >= preview_.cols / 2) {
                 viewport.width = std::max(16, track.x);
             } else {
@@ -966,11 +1023,19 @@ private:
             setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
             setRect(trackEdits_, {std::max(0, preview_.cols - 18), 0, 18, preview_.rows});
         }
+        if (pendingCalibrationProfile_) {
+            const CalibrationProfile loaded = *pendingCalibrationProfile_;
+            pendingCalibrationProfile_.reset();
+            if (applyCalibrationProfile(loaded, true)) return;
+        }
         std::wstring message = L"Preview captured by " + source_->name() + L" (" +
             std::to_wstring(preview_.cols) + L"x" + std::to_wstring(preview_.rows) + L"). ";
         if (!scrollbarCandidates_.empty()) {
-            message += std::to_wstring(scrollbarCandidates_.size()) +
-                       L" scrollbar candidate(s) highlighted. Click the correct numbered candidate.";
+            const int confidence = static_cast<int>(std::lround(
+                scrollbarCandidates_.front().observation.confidence * 100.0F));
+            message += L"The best scrollbar was selected (confidence " +
+                       std::to_wstring(confidence) +
+                       L"%). Only the selected scrollbar is shown.";
         } else {
             message += L"No scrollbar candidate found; set the orange track manually.";
         }
@@ -982,26 +1047,31 @@ private:
         logger_.info("calibration", "auto-detect scrollbar requested");
         if (preview_.empty()) capturePreview();
         if (preview_.empty()) return;
-        scrollbarCandidates_ = ScrollbarDetector::autoDetectAll(preview_);
-        logger_.info("calibration", "auto-detect completed candidates=" + std::to_string(scrollbarCandidates_.size()));
+        const auto detectedCandidates = ScrollbarDetector::autoDetectAll(preview_);
+        logger_.info("calibration", "auto-detect completed candidates=" + std::to_string(detectedCandidates.size()));
+        scrollbarCandidates_.clear();
         selectedScrollbarCandidate_.reset();
-        if (scrollbarCandidates_.empty()) {
+        if (detectedCandidates.empty()) {
             logger_.warning("calibration", "auto-detect found no scrollbar candidate");
             setStatus(L"No scrollbar candidate was found. Set the track rectangle manually.");
             InvalidateRect(previewCanvas_, nullptr, FALSE);
             return;
         }
-        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
-            const auto& candidate = scrollbarCandidates_[index];
+        for (std::size_t index = 0; index < detectedCandidates.size(); ++index) {
+            const auto& candidate = detectedCandidates[index];
             logger_.info("calibration", "candidate #" + std::to_string(index + 1) +
                          " track{" + rectDescription(candidate.config.track) + "} thumb{" +
                          rectDescription(candidate.observation.thumb) + "} confidence=" +
-                         std::to_string(candidate.observation.confidence));
+                         std::to_string(candidate.observation.confidence) + " selection_score=" +
+                         std::to_string(candidate.autoDetectionScore));
         }
+        scrollbarCandidates_.push_back(detectedCandidates.front());
         selectScrollbarCandidate(0, false);
-        setStatus(std::to_wstring(scrollbarCandidates_.size()) +
-                  L" scrollbar candidate(s) highlighted. Click the correct numbered candidate; "
-                  L"the orange rectangle is currently selected.");
+        const int confidence = static_cast<int>(std::lround(
+            scrollbarCandidates_.front().observation.confidence * 100.0F));
+        setStatus(L"The best scrollbar was selected (confidence " +
+                  std::to_wstring(confidence) +
+                  L"%). Only the orange selected rectangle is shown; drag it to adjust.");
     }
 
     void startCapture() {
@@ -1011,28 +1081,49 @@ private:
         if (!ensureSource()) return;
         const int calibratedWidth = preview_.cols;
         const int calibratedHeight = preview_.rows;
-        const auto frame = source_->capture();
-        if (!frame) {
-            logger_.error("capture", "first frame unavailable");
-            setStatus(L"Could not obtain the first frame; capture a preview again.");
-            return;
+        cv::Mat firstFrame;
+        int firstFrameAttempts = 0;
+        for (; firstFrameAttempts < 8 && firstFrame.empty(); ++firstFrameAttempts) {
+            const auto captured = source_->capture();
+            if (captured) {
+                firstFrame = captured->bgra.clone();
+                break;
+            }
+            if (firstFrameAttempts + 1 < 8) Sleep(20);
         }
-        if ((calibratedWidth > 0 && frame->width() != calibratedWidth) ||
-            (calibratedHeight > 0 && frame->height() != calibratedHeight)) {
+        if (firstFrame.empty()) {
+            // An unchanged WGC target may have an empty compositor queue. The
+            // calibrated preview is the last known complete frame and is a
+            // safe baseline when dimensions still match.
+            if (!preview_.empty() && source_->width() == preview_.cols &&
+                source_->height() == preview_.rows) {
+                firstFrame = preview_.clone();
+                logger_.warning("capture", "first frame queue remained empty after retries; "
+                                "using the calibrated preview as the baseline");
+            } else {
+                logger_.error("capture", "first frame unavailable after retries=" +
+                              std::to_string(firstFrameAttempts));
+                setStatus(L"Could not obtain the first frame; capture a preview again.");
+                return;
+            }
+        }
+        if ((calibratedWidth > 0 && firstFrame.cols != calibratedWidth) ||
+            (calibratedHeight > 0 && firstFrame.rows != calibratedHeight)) {
             logger_.warning("capture", "target resized before start from=" + std::to_string(calibratedWidth) +
                             "x" + std::to_string(calibratedHeight) + " to=" +
-                            std::to_string(frame->width()) + "x" + std::to_string(frame->height()));
-            preview_ = frame->bgra.clone();
+                            std::to_string(firstFrame.cols) + "x" + std::to_string(firstFrame.rows));
+            preview_ = firstFrame;
             InvalidateRect(previewCanvas_, nullptr, TRUE);
             session_.reset();
             setStatus(L"The target changed size; capture a new preview and recalibrate.");
             return;
         }
-        preview_ = frame->bgra.clone();
+        preview_ = std::move(firstFrame);
         InvalidateRect(previewCanvas_, nullptr, FALSE);
         StitchOptions options;
         options.viewport = readRect(viewportEdits_);
         options.scrollbar.track = readRect(trackEdits_);
+        options.scrollbar.side = scrollbarSide_;
         options.scrollbar.enabled = true;
         logger_.info("capture", "start options viewport{" + rectDescription(options.viewport) +
                      "} scrollbar{" + rectDescription(options.scrollbar.track) + "} preview=" +
@@ -1046,6 +1137,11 @@ private:
             logger_.error("capture", "stitch session start failed: " + session_.lastMessage());
             setStatus(widen(session_.lastMessage()));
             return;
+        }
+        if (session_.viewport().y != options.viewport.y ||
+            session_.viewport().height != options.viewport.height) {
+            logger_.info("capture", "static mask adjusted effective viewport{" +
+                         rectDescription(session_.viewport()) + "}");
         }
         capturing_ = true;
         captureTickCount_ = 0;
@@ -1061,7 +1157,6 @@ private:
         if (!capturing_ && session_.state() != SessionState::Paused &&
             session_.state() != SessionState::Capturing) return;
         capturing_ = false;
-        KillTimer(window_, kTimer);
         if (session_.finish()) {
             logger_.info("capture", "capture finalized accepted_frames=" + std::to_string(session_.acceptedFrames()) +
                          " output_rows=" + std::to_string(session_.outputRows()));
@@ -1075,7 +1170,17 @@ private:
     }
 
     void captureTick() {
-        if (!capturing_ || !source_) return;
+        if (!source_) return;
+        if (!capturing_) {
+            const auto frame = source_->capture();
+            if (!frame) return;
+            if (!preview_.empty() && frame->width() == preview_.cols &&
+                frame->height() == preview_.rows) {
+                preview_ = frame->bgra;
+                InvalidateRect(previewCanvas_, nullptr, FALSE);
+            }
+            return;
+        }
         ++captureTickCount_;
 
         bool sawFrame = false;
@@ -1099,6 +1204,12 @@ private:
                 return;
             }
 
+            // Keep the calibration canvas live during capture. cv::Mat's
+            // reference counting keeps these pixels alive after the optional
+            // CaptureFrame leaves scope; invalidations coalesce when several
+            // queued frames are drained in one tick.
+            preview_ = frame->bgra;
+            InvalidateRect(previewCanvas_, nullptr, FALSE);
             lastUpdate = session_.process(frame->bgra);
             if (lastUpdate.accepted || lastUpdate.rejected || lastUpdate.paused) {
                 logger_.info("stitch", "update accepted=" + std::to_string(lastUpdate.accepted ? 1 : 0) +
@@ -1111,12 +1222,12 @@ private:
                              " expected_shift=" + std::to_string(lastUpdate.expectedShift) +
                              " consecutive_rejections=" + std::to_string(lastUpdate.consecutiveRejections) +
                              " visual_confidence=" + std::to_string(lastUpdate.confidence) +
+                             " visual_margin=" + std::to_string(lastUpdate.margin) +
                              " scrollbar_confidence=" + std::to_string(lastUpdate.scrollbarConfidence) +
                              " message=" + lastUpdate.message);
             }
             if (lastUpdate.paused) {
                 capturing_ = false;
-                KillTimer(window_, kTimer);
                 setStatus(std::wstring(L"PAUSED: ") + widen(lastUpdate.message));
                 return;
             }
@@ -1159,6 +1270,88 @@ private:
             setStatus(L"RECOVERING: " + widen(lastUpdate.message) +
                       L" (mouse wheel may be jumping too far — try slower notches or the down arrow)");
         }
+    }
+
+    void saveTemplate() {
+        logger_.info("calibration", "save template requested");
+        if (capturing_) {
+            setStatus(L"Stop the current capture before saving a calibration template.");
+            return;
+        }
+        if (preview_.empty()) {
+            setStatus(L"Capture a preview and calibrate the two areas before saving a template.");
+            return;
+        }
+        CalibrationProfile profile;
+        profile.frameWidth = preview_.cols;
+        profile.frameHeight = preview_.rows;
+        profile.content = readRect(viewportEdits_);
+        profile.scrollbar.track = readRect(trackEdits_);
+        profile.scrollbar.side = scrollbarSide_;
+        profile.scrollbar.enabled = true;
+        if (!profile.valid()) {
+            setStatus(L"The content or scrollbar area is outside the preview. Adjust both rectangles before saving.");
+            return;
+        }
+
+        wchar_t filename[MAX_PATH] = L"scroll_stitch_template.ussconfig";
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = L"Scroll Stitcher template (*.ussconfig)\0*.ussconfig\0All files (*.*)\0*.*\0";
+        dialog.lpstrFile = filename;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
+        dialog.lpstrDefExt = L"ussconfig";
+        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetSaveFileNameW(&dialog)) {
+            logger_.info("calibration", "save template dialog cancelled");
+            return;
+        }
+        std::filesystem::path path(filename);
+        if (path.extension().empty()) path += L".ussconfig";
+        std::string error;
+        if (!saveCalibrationProfile(path, profile, error)) {
+            logger_.error("calibration", "template save failed path=" + narrow(path.wstring()) +
+                          " error=" + error);
+            setStatus(L"Could not save the template: " + widen(error));
+            return;
+        }
+        logger_.info("calibration", "template saved path=" + narrow(path.wstring()));
+        setStatus(L"Template saved: " + path.wstring());
+    }
+
+    void loadTemplate() {
+        logger_.info("calibration", "load template requested");
+        if (capturing_) {
+            setStatus(L"Stop the current capture before loading a calibration template.");
+            return;
+        }
+        wchar_t filename[MAX_PATH]{};
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = L"Scroll Stitcher template (*.ussconfig)\0*.ussconfig\0All files (*.*)\0*.*\0";
+        dialog.lpstrFile = filename;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
+        dialog.lpstrDefExt = L"ussconfig";
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&dialog)) {
+            logger_.info("calibration", "load template dialog cancelled");
+            return;
+        }
+        std::string error;
+        const auto loaded = loadCalibrationProfile(filename, error);
+        if (!loaded) {
+            logger_.error("calibration", "template load failed path=" + narrow(filename) +
+                          " error=" + error);
+            setStatus(L"Could not load the template: " + widen(error));
+            return;
+        }
+        logger_.info("calibration", "template loaded path=" + narrow(filename));
+        if (preview_.empty()) {
+            pendingCalibrationProfile_ = *loaded;
+            setStatus(L"Template loaded. Capture a preview and its two areas will be restored automatically.");
+            return;
+        }
+        applyCalibrationProfile(*loaded, true);
     }
 
     void exportImage() {
@@ -1214,6 +1407,8 @@ private:
         case kStart: startCapture(); break;
         case kStop: stopCapture(); break;
         case kExport: exportImage(); break;
+        case kSaveTemplate: saveTemplate(); break;
+        case kLoadTemplate: loadTemplate(); break;
         case kLoggingEnable: toggleLogging(); break;
         case kOpenLogs: openLogs(); break;
         default: break;

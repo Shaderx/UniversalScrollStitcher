@@ -35,6 +35,7 @@ if (WIN32)
 endif()
 
 add_library(stitch_core
+    src/stitch/CalibrationProfile.cpp
     src/stitch/ScrollbarDetector.cpp
     src/stitch/VerticalShiftEstimator.cpp
     src/stitch/SeamFinder.cpp
