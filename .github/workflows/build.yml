@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: portable-release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   VCPKG_ROOT: ${{ github.workspace }}\vcpkg
 
@@ -21,10 +25,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check out vcpkg
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: microsoft/vcpkg
           ref: efcfaaf60d7ec57a159fc3110403d939bfb69729
@@ -58,23 +62,41 @@ jobs:
         run: Compress-Archive -Path release-candidate\* -DestinationPath UniversalScrollStitcher-windows-x64.zip
 
       - name: Upload portable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UniversalScrollStitcher-windows-x64
           path: release-candidate/
           if-no-files-found: error
 
-      - name: Publish tagged GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub release
+        if: github.event_name == 'push'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $isVersionTag = '${{ github.ref_type }}' -eq 'tag'
+          $tagName = if ($isVersionTag) {
+            '${{ github.ref_name }}'
+          } else {
+            'build-${{ github.run_number }}'
+          }
+          $title = if ($isVersionTag) {
+            'Universal Scroll Stitcher ${{ github.ref_name }}'
+          } else {
+            'Universal Scroll Stitcher build #${{ github.run_number }}'
+          }
           $arguments = @(
-            'release', 'create', '${{ github.ref_name }}',
+            'release', 'create', $tagName,
             'UniversalScrollStitcher-windows-x64.zip',
-            '--title', 'Universal Scroll Stitcher ${{ github.ref_name }}',
+            '--title', $title,
             '--generate-notes'
           )
-          if ('${{ github.ref_name }}' -match '-') { $arguments += '--prerelease' }
+          if ($isVersionTag -and '${{ github.ref_name }}' -match '-') {
+            $arguments += '--prerelease'
+          } else {
+            $arguments += '--latest'
+          }
+          if (-not $isVersionTag) {
+            $arguments += @('--target', '${{ github.sha }}')
+          }
           gh @arguments

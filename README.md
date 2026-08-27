@@ -51,7 +51,7 @@ latest portable-release credit visible in the footer.
 
 ## Portable release pipeline
 
-The GitHub Actions workflow builds and tests a statically linked x64 Release executable. Each run uploads a `UniversalScrollStitcher-windows-x64` artifact containing the contents of `release-candidate/`. Pushing a tag such as `v0.1.0` also publishes the ZIP to GitHub Releases; tags containing a suffix such as `v0.1.0-rc.1` are marked as prereleases.
+The GitHub Actions workflow builds and tests a statically linked x64 Release executable. Each successful push to `main` uploads a `UniversalScrollStitcher-windows-x64` artifact and automatically publishes its ZIP as the latest GitHub Release under a `build-N` tag. Pushing a version tag such as `v0.1.0` publishes a named release instead; tags containing a suffix such as `v0.1.0-rc.1` are marked as prereleases.
 
 To make the same portable folder locally:
 
