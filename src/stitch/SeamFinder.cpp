@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace universal_stitcher {
 
@@ -24,7 +25,7 @@ Seam SeamFinder::find(const cv::Mat& previousBgra, const cv::Mat& currentBgra,
     cv::Mat previousGray, currentGray;
     cv::cvtColor(previousBgra, previousGray, cv::COLOR_BGRA2GRAY);
     cv::cvtColor(currentBgra, currentGray, cv::COLOR_BGRA2GRAY);
-    constexpr int kMaximumSeamWidth = 480;
+    constexpr int kMaximumSeamWidth = 256;
     if (previousGray.cols > kMaximumSeamWidth) {
         cv::resize(previousGray, previousGray,
                    cv::Size(kMaximumSeamWidth, previousGray.rows), 0.0, 0.0, cv::INTER_AREA);
@@ -46,33 +47,62 @@ Seam SeamFinder::find(const cv::Mat& previousBgra, const cv::Mat& currentBgra,
         activity.release();
     }
 
+    // Compute every aligned row difference in one vectorized pass, then use
+    // prefix sums for the small smoothing window. This replaces hundreds of
+    // per-row cv::Mat allocations and is important for keeping up with a 60 Hz
+    // capture stream.
+    cv::Mat alignedDifference;
+    cv::absdiff(previousGray(cv::Rect(marginX, shift, width, overlap)),
+                currentGray(cv::Rect(marginX, 0, width, overlap)), alignedDifference);
+    std::vector<float> rowCosts(static_cast<std::size_t>(overlap), -1.0F);
+    if (!activity.empty()) {
+        cv::Mat combinedActivity;
+        cv::bitwise_and(activity(cv::Rect(marginX, shift, width, overlap)),
+                        activity(cv::Rect(marginX, 0, width, overlap)), combinedActivity);
+        cv::Mat maskedDifference = cv::Mat::zeros(alignedDifference.size(), alignedDifference.type());
+        alignedDifference.copyTo(maskedDifference, combinedActivity);
+        cv::Mat differenceSums;
+        cv::Mat activitySums;
+        cv::reduce(maskedDifference, differenceSums, 1, cv::REDUCE_SUM, CV_64F);
+        cv::reduce(combinedActivity, activitySums, 1, cv::REDUCE_SUM, CV_64F);
+        const int minimumActive = std::max(4, width / 100);
+        for (int row = 0; row < overlap; ++row) {
+            const double activePixels = activitySums.at<double>(row, 0) / 255.0;
+            if (activePixels >= minimumActive) {
+                rowCosts[static_cast<std::size_t>(row)] = static_cast<float>(
+                    differenceSums.at<double>(row, 0) / (activePixels * 255.0));
+            }
+        }
+    } else {
+        cv::Mat averages;
+        cv::reduce(alignedDifference, averages, 1, cv::REDUCE_AVG, CV_32F);
+        for (int row = 0; row < overlap; ++row) {
+            rowCosts[static_cast<std::size_t>(row)] = averages.at<float>(row, 0) / 255.0F;
+        }
+    }
+
+    std::vector<double> costPrefix(static_cast<std::size_t>(overlap + 1), 0.0);
+    std::vector<int> countPrefix(static_cast<std::size_t>(overlap + 1), 0);
+    for (int row = 0; row < overlap; ++row) {
+        const float cost = rowCosts[static_cast<std::size_t>(row)];
+        costPrefix[static_cast<std::size_t>(row + 1)] =
+            costPrefix[static_cast<std::size_t>(row)] + (cost >= 0.0F ? cost : 0.0F);
+        countPrefix[static_cast<std::size_t>(row + 1)] =
+            countPrefix[static_cast<std::size_t>(row)] + (cost >= 0.0F ? 1 : 0);
+    }
+
     Seam best;
     best.cost = 2.0F;
     const int window = std::max(1, std::min(3, overlap / 20));
     for (int row = firstRow; row <= lastRow; ++row) {
         const int top = std::max(firstRow, row - window);
         const int bottom = std::min(lastRow, row + window);
-        float difference = 0.0F;
-        int comparedRows = 0;
-        for (int y = top; y <= bottom; ++y) {
-            cv::Mat oldRoi = previousGray(cv::Rect(marginX, y + shift, width, 1));
-            cv::Mat newRoi = currentGray(cv::Rect(marginX, y, width, 1));
-            cv::Mat absDifference;
-            cv::absdiff(oldRoi, newRoi, absDifference);
-            if (!activity.empty()) {
-                const cv::Mat oldActivity = activity(cv::Rect(marginX, y + shift, width, 1));
-                const cv::Mat newActivity = activity(cv::Rect(marginX, y, width, 1));
-                cv::Mat combinedActivity;
-                cv::bitwise_and(oldActivity, newActivity, combinedActivity);
-                if (cv::countNonZero(combinedActivity) < std::max(4, width / 100)) continue;
-                difference += static_cast<float>(cv::mean(absDifference, combinedActivity)[0] / 255.0);
-            } else {
-                difference += static_cast<float>(cv::mean(absDifference)[0] / 255.0);
-            }
-            ++comparedRows;
-        }
+        const int comparedRows = countPrefix[static_cast<std::size_t>(bottom + 1)] -
+                                 countPrefix[static_cast<std::size_t>(top)];
         if (comparedRows == 0) continue;
-        difference /= static_cast<float>(comparedRows);
+        const float difference = static_cast<float>(
+            (costPrefix[static_cast<std::size_t>(bottom + 1)] -
+             costPrefix[static_cast<std::size_t>(top)]) / comparedRows);
         if (difference < best.cost) best = {true, row, difference};
     }
     return best;

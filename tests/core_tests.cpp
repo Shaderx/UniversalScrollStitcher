@@ -146,6 +146,32 @@ cv::Mat grayGameScrollbarFrame() {
     return frame;
 }
 
+cv::Mat interiorGameScrollbarFrame() {
+    constexpr int width = 480;
+    constexpr int height = 300;
+    cv::Mat frame(height, width, CV_8UC4, cv::Scalar(254, 254, 254, 255));
+    // A five-pixel game scrollbar in the interior of a wide top-level window.
+    // Percentage-derived edge-only scans used to miss this configuration.
+    for (int y = 40; y < 260; ++y) {
+        for (int x = 250; x < 255; ++x) {
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(217, 210, 211, 255);
+        }
+    }
+    for (int y = 40; y < 125; ++y) {
+        for (int x = 250; x < 255; ++x) {
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(140, 121, 123, 255);
+        }
+    }
+    // High-contrast outer-window decorations must not prevent the interior
+    // track from being returned as a selectable candidate.
+    for (int y = 180; y < height; ++y) {
+        for (int x = width - 12; x < width; ++x) {
+            frame.at<cv::Vec4b>(y, x) = cv::Vec4b(70, 70, 70, 255);
+        }
+    }
+    return frame;
+}
+
 cv::Mat staticOverlayFrame(int documentOffset, int thumbTop) {
     cv::Mat frame = fullFrame(documentOffset, thumbTop);
     // Fixed sidebar with vertical detail: comparing it at y+shift versus y is
@@ -209,6 +235,54 @@ void testLargeWheelLikeShift() {
     require(estimate.shift == shift,
             "broad fallback should recover the true large shift (actual=" +
             std::to_string(estimate.shift) + ", reason=" + estimate.reason + ")");
+}
+
+void testNearViewportSizedShift() {
+    constexpr int height = 600;
+    constexpr int width = 128;
+    constexpr int shift = 540; // 90% jump, leaving the default 10% overlap.
+    auto uniqueDocument = [](int firstRow) {
+        cv::Mat image(height, width, CV_8UC4);
+        for (int y = 0; y < height; ++y) {
+            const int documentY = firstRow + y;
+            for (int x = 0; x < width; ++x) {
+                std::uint32_t hash = static_cast<std::uint32_t>(documentY) * 2246822519u +
+                                     static_cast<std::uint32_t>(x) * 3266489917u + 0x9e3779b9u;
+                hash ^= hash >> 15;
+                hash *= 2246822519u;
+                hash ^= hash >> 13;
+                auto& pixel = image.at<cv::Vec4b>(y, x);
+                pixel[0] = static_cast<unsigned char>(hash & 0xff);
+                pixel[1] = static_cast<unsigned char>((hash >> 8) & 0xff);
+                pixel[2] = static_cast<unsigned char>((hash >> 16) & 0xff);
+                pixel[3] = 255;
+            }
+        }
+        return image;
+    };
+    const ShiftEstimate estimate = VerticalShiftEstimator::estimate(
+        uniqueDocument(0), uniqueDocument(shift), 24);
+    require(estimate.accepted,
+            "a 90-percent viewport jump should retain enough overlap to stitch (reason=" +
+            estimate.reason + ", shift=" + std::to_string(estimate.shift) +
+            ", confidence=" + std::to_string(estimate.confidence) +
+            ", margin=" + std::to_string(estimate.margin) + ")");
+    require(estimate.shift == shift,
+            "near-viewport-sized jump should recover its exact displacement (actual=" +
+            std::to_string(estimate.shift) + ", expected=" + std::to_string(shift) +
+            ", confidence=" + std::to_string(estimate.confidence) +
+            ", reason=" + estimate.reason + ")");
+
+    ShiftEstimatorOptions aggressive;
+    aggressive.minimumOverlapRatio = 0.05F;
+    constexpr int aggressiveShift = 570;
+    const ShiftEstimate aggressiveEstimate = VerticalShiftEstimator::estimate(
+        uniqueDocument(0), uniqueDocument(aggressiveShift), 24, aggressive);
+    require(aggressiveEstimate.accepted && aggressiveEstimate.shift == aggressiveShift,
+            "the slider's 95-percent endpoint should be searchable (actual=" +
+            std::to_string(aggressiveEstimate.shift) + ", confidence=" +
+            std::to_string(aggressiveEstimate.confidence) + ", reason=" +
+            aggressiveEstimate.reason + ")");
 }
 
 void testSmoothScrollAdjacentShiftsAreOnePeak() {
@@ -307,6 +381,18 @@ void testGrayGameScrollbarRanksFirst() {
     require(selected.y >= 28 && selected.y <= 32 &&
             selected.height >= 125 && selected.height <= 135,
             "gray scrollbar track bounds should match its moving middle panel");
+}
+
+void testInteriorScrollbarIsSelectable() {
+    const auto candidates = ScrollbarDetector::autoDetectAll(interiorGameScrollbarFrame());
+    const auto found = std::find_if(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& candidate) {
+        return candidate.config.side == ScrollbarSide::Right &&
+               candidate.config.track.x >= 246 && candidate.config.track.x <= 254 &&
+               candidate.config.track.y >= 36 && candidate.config.track.y <= 44 &&
+               candidate.config.track.bottom() >= 255;
+    });
+    require(found != candidates.end(),
+            "a thin scrollbar inside a wide window should be returned for manual selection");
 }
 
 void testCalibrationProfileRoundTripAndScaling() {
@@ -565,11 +651,13 @@ void testTopOfDocumentIsRecognizedBelowChrome() {
 int main() {
     testShiftAndSeam();
     testLargeWheelLikeShift();
+    testNearViewportSizedShift();
     testSmoothScrollAdjacentShiftsAreOnePeak();
     testDisagreementIsRejected();
     testScrollbarDetection();
     testMultipleScrollbarCandidates();
     testGrayGameScrollbarRanksFirst();
+    testInteriorScrollbarIsSelectable();
     testCalibrationProfileRoundTripAndScaling();
     testTrackExtentExcludesWindowChrome();
     testTopOfDocumentIsRecognizedBelowChrome();

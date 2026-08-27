@@ -26,7 +26,7 @@ struct ShiftEstimatorOptions {
     float priorToleranceRatio = 1.0F;
     int minimumPriorTolerance = 32;
     // Allow stitching when only a thinner band still overlaps between samples.
-    float minimumOverlapRatio = 0.15F;
+    float minimumOverlapRatio = 0.10F;
 };
 
 // Estimates the amount by which current content moved downward relative to
@@ -41,4 +41,3 @@ public:
 };
 
 } // namespace universal_stitcher
-

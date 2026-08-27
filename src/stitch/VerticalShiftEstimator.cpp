@@ -23,7 +23,7 @@ cv::Mat registrationImage(const cv::Mat& bgra) {
     // horizontal working set. Full-width 1920px correlation blocked the UI
     // thread for 50-250 ms per frame while providing little extra vertical
     // registration information.
-    constexpr int kMaximumRegistrationWidth = 480;
+    constexpr int kMaximumRegistrationWidth = 256;
     if (gray.cols > kMaximumRegistrationWidth) {
         cv::resize(gray, gray, cv::Size(kMaximumRegistrationWidth, gray.rows),
                    0.0, 0.0, cv::INTER_AREA);
@@ -82,6 +82,21 @@ float scoreShift(const cv::Mat& previous, const cv::Mat& current, int shift,
     const int overlap = height - shift;
     if (overlap < static_cast<int>(height * minimumOverlapRatio)) return -1.0F;
 
+    // Materialize the aligned overlap once per candidate. The previous
+    // implementation allocated and compared four separate ROIs, which made a
+    // broad large-jump search expensive enough to fall behind the capture
+    // queue. The four-band scoring below is unchanged; it now reads views into
+    // one vectorized difference image.
+    cv::Mat difference;
+    cv::absdiff(previous(cv::Rect(marginX, shift, comparisonWidth, overlap)),
+                current(cv::Rect(marginX, 0, comparisonWidth, overlap)), difference);
+    cv::Mat combinedActivity;
+    if (!activity.empty()) {
+        const cv::Mat oldActivity = activity(cv::Rect(marginX, shift, comparisonWidth, overlap));
+        const cv::Mat newActivity = activity(cv::Rect(marginX, 0, comparisonWidth, overlap));
+        cv::bitwise_and(oldActivity, newActivity, combinedActivity);
+    }
+
     const int bandHeight = std::max(8, overlap / 4);
     float scoreSum = 0.0F;
     float minimum = 1.0F;
@@ -89,9 +104,19 @@ float scoreShift(const cv::Mat& previous, const cv::Mat& current, int shift,
     for (int band = 0; band < 4; ++band) {
         const int y = band == 3 ? std::max(0, overlap - bandHeight) : band * overlap / 4;
         const int availableHeight = std::min(bandHeight, overlap - y);
-        const float score = scoreBand(previous, current, shift, activity, marginX, y,
-                                      comparisonWidth, availableHeight);
-        if (score < 0.0F) continue;
+        const cv::Rect bandRect(0, y, comparisonWidth, availableHeight);
+        double meanDifference = 0.0;
+        if (!combinedActivity.empty()) {
+            const cv::Mat bandActivity = combinedActivity(bandRect);
+            const int activePixels = cv::countNonZero(bandActivity);
+            const int minimumActive = std::max(32, comparisonWidth * availableHeight / 100);
+            if (activePixels < minimumActive) continue;
+            meanDifference = cv::mean(difference(bandRect), bandActivity)[0];
+        } else {
+            meanDifference = cv::mean(difference(bandRect))[0];
+        }
+        const float score = std::clamp(
+            1.0F - static_cast<float>(meanDifference / 255.0), 0.0F, 1.0F);
         scoreSum += score;
         minimum = std::min(minimum, score);
         ++bandCount;
@@ -124,6 +149,10 @@ std::vector<Candidate> collectCandidates(const cv::Mat& previous, const cv::Mat&
     };
 
     for (int shift = minimumShift; shift <= maximumShift; shift += stride) consider(shift);
+    // The coarse stride may not land exactly on the configured upper bound.
+    // Always test that endpoint so a 90% slider setting really includes a
+    // jump of exactly 90% rather than stopping a few rows short.
+    consider(maximumShift);
     if (preferredShift > 0) {
         for (int shift = preferredShift - stride; shift <= preferredShift + stride; ++shift) {
             consider(shift);
@@ -272,7 +301,9 @@ ShiftEstimate VerticalShiftEstimator::estimate(const cv::Mat& previousBgra,
     const int comparisonWidth = width - marginX * 2;
     // Mouse-wheel notches often move most of a viewport between samples.
     // Keep a thin overlap band so registration still has something to lock onto.
-    const int broadMaximum = std::max(1, static_cast<int>(height * (1.0F - options.minimumOverlapRatio)));
+    const int broadMaximum = std::clamp(
+        static_cast<int>(std::lround(height * (1.0F - options.minimumOverlapRatio))),
+        1, height - 1);
 
     const Candidate duplicate{0, scoreBand(previous, current, 0, {}, marginX, 0,
                                            comparisonWidth, height), 0.0F};

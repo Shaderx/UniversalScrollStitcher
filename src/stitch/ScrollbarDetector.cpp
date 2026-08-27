@@ -205,7 +205,7 @@ float candidateSelectionScore(const cv::Mat& bgra, const ScrollbarCandidate& can
 }
 
 void collectNeutralGrayCandidates(const cv::Mat& bgra, int candidateWidth,
-                                  int firstX, int lastX, ScrollbarSide side,
+                                  int firstX, int lastX, int leftSideBoundary,
                                   std::vector<ScrollbarCandidate>& candidates) {
     const int minimumThumbHeight = std::max(4, std::min(24, bgra.rows / 100));
     const int maximumThumbHeight = static_cast<int>(bgra.rows * 0.60F);
@@ -283,7 +283,10 @@ void collectNeutralGrayCandidates(const cv::Mat& bgra, int candidateWidth,
             if (trackHeight < std::max(64, thumbHeight + std::max(8, thumbHeight / 3))) continue;
 
             ScrollbarCandidate candidate{
-                {{x, trackTop, candidateWidth, trackHeight}, side, true},
+                {{x, trackTop, candidateWidth, trackHeight},
+                 x + candidateWidth / 2 < leftSideBoundary
+                     ? ScrollbarSide::Left : ScrollbarSide::Right,
+                 true},
                 {true, {x, completedStart, candidateWidth, thumbHeight},
                  std::clamp(0.55F + contrast / 220.0F, 0.0F, 1.0F)}};
             candidate.autoDetectionScore = candidateSelectionScore(bgra, candidate);
@@ -307,10 +310,15 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
     // Modern overlay/game scrollbars are often only 5-8 physical pixels wide.
     // A strip around 2.5% of the window averaged the supplied gray thumb into
     // adjacent colorful content and promoted unrelated bottom-edge controls.
-    const int candidateWidth = std::clamp(static_cast<int>(std::round(bgra.cols * 0.012)), 5, 16);
-    const int searchWidth = std::max(candidateWidth + 2, static_cast<int>(std::round(bgra.cols * 0.12)));
+    const int scaledWidth = std::clamp(static_cast<int>(std::round(bgra.cols * 0.012)), 5, 16);
+    std::vector<int> candidateWidths{5, 8, scaledWidth};
+    std::sort(candidateWidths.begin(), candidateWidths.end());
+    candidateWidths.erase(std::unique(candidateWidths.begin(), candidateWidths.end()),
+                          candidateWidths.end());
+    const int leftSideBoundary = std::max(
+        scaledWidth + 2, static_cast<int>(std::round(bgra.cols * 0.12)));
 
-    auto collect = [&](int firstX, int lastX, ScrollbarSide side) {
+    auto collect = [&](int candidateWidth, int firstX, int lastX) {
         for (int x = firstX; x <= lastX; ++x) {
             const Rect strip{x, 0, candidateWidth, bgra.rows};
             const RunResult run = findRun(bgra, strip);
@@ -321,6 +329,8 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
             // title bar makes a document that is at the top look scrolled.
             const Rect track{strip.x, run.trackTop, strip.width, run.trackBottom - run.trackTop};
             if (!track.valid()) continue;
+            const ScrollbarSide side = x + candidateWidth / 2 < leftSideBoundary
+                ? ScrollbarSide::Left : ScrollbarSide::Right;
             ScrollbarCandidate candidate{
                 {track, side, true},
                 {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence}};
@@ -329,16 +339,16 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
         }
     };
 
-    collect(0, searchWidth - candidateWidth, ScrollbarSide::Left);
-    collect(bgra.cols - searchWidth, bgra.cols - candidateWidth, ScrollbarSide::Right);
-    // Also look explicitly for a neutral gray thumb on a lighter neutral
-    // track. This catches thin game scrollbars whose track itself contrasts
-    // with the surrounding white UI and would otherwise merge into one long
-    // generic luminance run.
-    collectNeutralGrayCandidates(bgra, candidateWidth, 0, searchWidth - candidateWidth,
-                                 ScrollbarSide::Left, candidates);
-    collectNeutralGrayCandidates(bgra, candidateWidth, bgra.cols - searchWidth,
-                                 bgra.cols - candidateWidth, ScrollbarSide::Right, candidates);
+    for (const int candidateWidth : candidateWidths) {
+        const int lastX = bgra.cols - candidateWidth;
+        collect(candidateWidth, 0, lastX);
+        // Also look explicitly for a neutral gray thumb on a lighter neutral
+        // track. Multiple widths preserve very thin game scrollbars even in a
+        // wide top-level window where a percentage-derived strip would blend
+        // the thumb into neighboring content.
+        collectNeutralGrayCandidates(bgra, candidateWidth, 0, lastX,
+                                     leftSideBoundary, candidates);
+    }
 
     std::sort(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& left,
                                                        const ScrollbarCandidate& right) {
@@ -364,15 +374,21 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
     // identical hits. Keep only the strongest member of each horizontal
     // cluster while preserving genuinely separate scrollbars.
     std::vector<ScrollbarCandidate> distinct;
-    constexpr std::size_t kMaximumCandidates = 12;
     for (const auto& candidate : candidates) {
         const int center = candidate.config.track.x + candidate.config.track.width / 2;
         const bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const ScrollbarCandidate& existing) {
             const int existingCenter = existing.config.track.x + existing.config.track.width / 2;
-            return std::abs(center - existingCenter) <= candidateWidth * 2;
+            const int intersectionTop = std::max(candidate.config.track.y, existing.config.track.y);
+            const int intersectionBottom = std::min(candidate.config.track.bottom(),
+                                                    existing.config.track.bottom());
+            const int verticalIntersection = std::max(0, intersectionBottom - intersectionTop);
+            const int shorterTrack = std::min(candidate.config.track.height,
+                                              existing.config.track.height);
+            return std::abs(center - existingCenter) <=
+                       std::max(candidate.config.track.width, existing.config.track.width) * 2 &&
+                   verticalIntersection * 2 >= shorterTrack;
         });
         if (!duplicate) distinct.push_back(candidate);
-        if (distinct.size() == kMaximumCandidates) break;
     }
 
     return distinct;

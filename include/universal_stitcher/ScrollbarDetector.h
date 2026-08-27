@@ -28,8 +28,8 @@ struct ScrollbarCandidate {
     ScrollbarConfig config;
     ScrollbarObservation observation;
     // Ranking combines motion-thumb contrast, neutral scrollbar color, edge
-    // proximity, and the detector's run confidence. It is only used for
-    // choosing the single automatic result.
+    // proximity, and the detector's run confidence. The GUI uses it to order
+    // every distinct candidate in its manual selection list.
     float autoDetectionScore = 0.0F;
 };
 
@@ -39,9 +39,10 @@ struct ScrollbarCandidate {
 // hard-coded color.
 class ScrollbarDetector final {
 public:
-    // Returns distinct candidates ordered by automatic selection quality.
-    // The GUI consumes only the first result; the full list remains available
-    // for diagnostics and library callers.
+    // Returns distinct candidates across the full window, ordered by automatic
+    // selection quality. Searching the interior is important for games and
+    // split-pane applications whose scrollable panel occupies only part of a
+    // larger top-level window.
     [[nodiscard]] static std::vector<ScrollbarCandidate> autoDetectAll(const cv::Mat& bgra);
     [[nodiscard]] static std::optional<ScrollbarConfig> autoDetect(const cv::Mat& bgra);
     [[nodiscard]] static ScrollbarObservation detect(const cv::Mat& bgra,

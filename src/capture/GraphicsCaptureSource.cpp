@@ -62,11 +62,14 @@ bool GraphicsCaptureSource::start(HWND target) {
         if (impl_->size.Width <= 0 || impl_->size.Height <= 0) return false;
 
         // A deeper pool retains intermediate frames during mouse-wheel bursts
-        // so the stitcher can drain them instead of skipping ahead.
+        // so the 60 Hz stitch loop can drain them instead of skipping ahead.
+        // Eight BGRA surfaces are a deliberate memory/latency tradeoff: enough
+        // history for short accelerated-wheel bursts without an unbounded
+        // capture queue.
         impl_->framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::Create(
             impl_->directDevice,
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            4, impl_->size);
+            8, impl_->size);
         impl_->session = impl_->framePool.CreateCaptureSession(impl_->item);
         try {
             if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
@@ -100,7 +103,7 @@ std::optional<CaptureFrame> GraphicsCaptureSource::capture() {
             impl_->size = contentSize;
             impl_->framePool.Recreate(impl_->directDevice,
                 winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                4, impl_->size);
+                8, impl_->size);
             width_ = impl_->size.Width;
             height_ = impl_->size.Height;
             return std::nullopt;

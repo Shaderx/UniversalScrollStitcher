@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(UniversalScrollStitcher VERSION 0.1.0 LANGUAGES CXX)
+project(UniversalScrollStitcher VERSION 1.0.0 LANGUAGES CXX)
 
 option(UNIVERSAL_STITCHER_ENABLE_WGC "Enable Windows Graphics Capture when C++/WinRT is available" ON)
 option(UNIVERSAL_STITCHER_BUILD_TESTS "Build the portable stitching-core tests" ON)
@@ -74,7 +74,7 @@ if (WIN32)
         src/capture/GraphicsCaptureSource.cpp
     )
     target_include_directories(UniversalScrollStitcher PRIVATE include)
-    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export diagnostic_logger user32 gdi32 shcore dwmapi comdlg32 shell32)
+    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export diagnostic_logger user32 gdi32 shcore dwmapi comdlg32 comctl32 shell32)
     target_compile_definitions(UniversalScrollStitcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     copy_opencv_runtime(UniversalScrollStitcher)
 

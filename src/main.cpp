@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
 #include <windowsx.h>
@@ -52,6 +53,9 @@ enum ControlId : int {
     kTrackY = 131,
     kTrackWidth = 132,
     kTrackHeight = 133,
+    kMaximumJump = 140,
+    kScrollbarCandidateCombo = 141,
+    kSetScrollbarCandidate = 142,
     kStatus = 150,
     kLoggingEnable = 151,
     kOpenLogs = 152,
@@ -98,14 +102,18 @@ public:
 
 private:
     static constexpr UINT_PTR kTimer = 1;
-    // ~30 Hz is enough to catch mouse-wheel notches while staying responsive on
-    // the UI thread. Arrow-key scrolling was already fine at 10 Hz.
-    static constexpr UINT kTimerPeriodMs = 33;
+    // Poll the WGC queue at roughly 60 Hz so accelerated wheel bursts retain
+    // more intermediate views. The source itself controls the actual frame
+    // rate; this timer only establishes the maximum polling cadence.
+    static constexpr UINT kTimerPeriodMs = 16;
     // Bound work per UI tick so a burst cannot starve preview painting. The
-    // WGC pool retains four frames and the next tick continues draining it.
-    static constexpr int kMaximumFramesPerTick = 3;
+    // WGC pool retains eight frames and the next tick continues draining it.
+    static constexpr int kMaximumFramesPerTick = 4;
+    static constexpr int kMinimumJumpPercent = 50;
+    static constexpr int kMaximumJumpPercent = 95;
+    static constexpr int kDefaultJumpPercent = 90;
     static constexpr int kMinimumClientWidth = 980;
-    static constexpr int kMinimumClientHeight = 760;
+    static constexpr int kMinimumClientHeight = 820;
 
     HWND window_ = nullptr;
     HINSTANCE instance_ = nullptr;
@@ -121,6 +129,9 @@ private:
     HWND loggingCheckbox_ = nullptr;
     HWND openLogsButton_ = nullptr;
     HWND latestReleaseLink_ = nullptr;
+    HWND maximumJumpSlider_ = nullptr;
+    HWND maximumJumpValue_ = nullptr;
+    HWND scrollbarCandidateCombo_ = nullptr;
     HFONT latestReleaseFont_ = nullptr;
     HFONT bodyFont_ = nullptr;
     HFONT headingFont_ = nullptr;
@@ -209,6 +220,10 @@ private:
                 const int id = LOWORD(wParam);
                 if (!updatingCalibrationEdits_ && id >= kTrackX && id <= kTrackHeight) {
                     selectedScrollbarCandidate_.reset();
+                    if (scrollbarCandidateCombo_) {
+                        SendMessageW(scrollbarCandidateCombo_, CB_SETCURSEL,
+                                     static_cast<WPARAM>(-1), 0);
+                    }
                     const Rect track = readRect(trackEdits_);
                     if (!preview_.empty() && track.valid()) {
                         scrollbarSide_ = track.x + track.width / 2 < preview_.cols / 2
@@ -226,6 +241,14 @@ private:
                 logger_.info("target", "selected " + windowDescription(selectedTarget()));
             }
             return 0;
+        case WM_HSCROLL:
+            if (reinterpret_cast<HWND>(lParam) == maximumJumpSlider_) {
+                updateMaximumJumpLabel();
+                logger_.info("capture", "maximum single-frame jump changed percent=" +
+                             std::to_string(maximumJumpPercent()));
+                return 0;
+            }
+            return DefWindowProcW(window_, message, wParam, lParam);
         case WM_GETMINMAXINFO: {
             auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
             RECT desiredClient{0, 0, kMinimumClientWidth, kMinimumClientHeight};
@@ -334,7 +357,7 @@ private:
         addButton(L"Export PNG / JPEG", kExport, 636, 184, 164);
 
         calibrationCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
-                                           24, 232, 900, 130, window_, nullptr, instance_, nullptr);
+                                           24, 232, 900, 176, window_, nullptr, instance_, nullptr);
         addLabel(L"Calibration", 42, 246, 170);
         addLabel(L"Content viewport (capture pixels)", 42, 273, 240);
         addLabel(L"X", 42, 300, 18); addLabel(L"Y", 174, 300, 18);
@@ -348,26 +371,50 @@ private:
         trackEdits_[1] = addEdit(kTrackY, 702, 296, 64);
         trackEdits_[2] = addEdit(kTrackWidth, 774, 296, 64);
         trackEdits_[3] = addEdit(kTrackHeight, 846, 296, 64);
-        addButton(L"Save template", kSaveTemplate, 630, 326, 132);
-        addButton(L"Load template", kLoadTemplate, 774, 326, 132);
+        addLabel(L"Detected scrollbars", 42, 330, 154);
+        scrollbarCandidateCombo_ = CreateWindowExW(
+            0, L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST,
+            210, 324, 540, 280, window_, menuId(kScrollbarCandidateCombo), instance_, nullptr);
+        if (bodyFont_) SendMessageW(scrollbarCandidateCombo_, WM_SETFONT,
+                                    reinterpret_cast<WPARAM>(bodyFont_), TRUE);
+        SendMessageW(scrollbarCandidateCombo_, CB_SETDROPPEDWIDTH, 680, 0);
+        HWND setScrollbarButton = addButton(L"Set selected", kSetScrollbarCandidate, 762, 323, 144);
+        EnableWindow(setScrollbarButton, FALSE);
+
+        addLabel(L"Maximum single-frame jump", 42, 370, 174);
+        maximumJumpSlider_ = CreateWindowExW(
+            0, TRACKBAR_CLASSW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS,
+            218, 363, 244, 34, window_, menuId(kMaximumJump), instance_, nullptr);
+        SendMessageW(maximumJumpSlider_, TBM_SETRANGE, TRUE,
+                     MAKELPARAM(kMinimumJumpPercent, kMaximumJumpPercent));
+        SendMessageW(maximumJumpSlider_, TBM_SETTICFREQ, 5, 0);
+        SendMessageW(maximumJumpSlider_, TBM_SETLINESIZE, 0, 5);
+        SendMessageW(maximumJumpSlider_, TBM_SETPAGESIZE, 0, 10);
+        SendMessageW(maximumJumpSlider_, TBM_SETPOS, TRUE, kDefaultJumpPercent);
+        maximumJumpValue_ = addLabel(L"", 472, 370, 148);
+        updateMaximumJumpLabel();
+        addButton(L"Save template", kSaveTemplate, 630, 366, 132);
+        addButton(L"Load template", kLoadTemplate, 774, 366, 132);
 
         statusCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
-                                      24, 376, 900, 112, window_, nullptr, instance_, nullptr);
-        addLabel(L"Session status", 42, 389, 160);
-        addLabel(L"The app only captures frames and never sends input to the target. Scroll down manually in small increments.",
-                 42, 414, 820);
+                                      24, 422, 900, 112, window_, nullptr, instance_, nullptr);
+        addLabel(L"Session status", 42, 435, 160);
+        addLabel(L"The app only captures frames and never sends input. Scroll normally while retaining some visible overlap.",
+                 42, 460, 820);
         status_ = CreateWindowExW(0, L"STATIC", L"Select a target and capture a preview.",
                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-                                  42, 443, 864, 36, window_, menuId(kStatus), instance_, nullptr);
+                                  42, 489, 864, 36, window_, menuId(kStatus), instance_, nullptr);
         if (bodyFont_) SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE);
 
         previewCard_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDFRAME,
-                                       24, 500, 900, 220, window_, nullptr, instance_, nullptr);
-        addLabel(L"Preview & calibration", 42, 514, 220);
-        addLabel(L"Drag the green viewport or orange scrollbar rectangle to fine-tune it.", 300, 514, 560);
+                                       24, 546, 900, 220, window_, nullptr, instance_, nullptr);
+        addLabel(L"Preview & calibration", 42, 560, 220);
+        addLabel(L"Drag the green viewport or orange scrollbar rectangle to fine-tune it.", 300, 560, 560);
         previewCanvas_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"UniversalScrollStitcherPreview", nullptr,
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         36, 542, 876, 170, window_, nullptr, instance_, this);
+                                         36, 588, 876, 170, window_, nullptr, instance_, this);
 
         loggingCheckbox_ = CreateWindowExW(0, L"BUTTON", L"Enable diagnostic logging",
                                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -394,7 +441,7 @@ private:
         const int margin = 24;
         const int contentWidth = std::max(1, width - margin * 2);
         const int footerTop = std::max(0, clientHeight - 52);
-        const int previewTop = 500;
+        const int previewTop = 546;
         const int previewHeight = std::max(170, footerTop - previewTop - 12);
         const int buttonY = 184;
         if (title_) MoveWindow(title_, margin, 20, contentWidth, 38, TRUE);
@@ -409,15 +456,21 @@ private:
         if (HWND start = GetDlgItem(window_, kStart)) MoveWindow(start, 382, buttonY, 130, 34, TRUE);
         if (HWND stop = GetDlgItem(window_, kStop)) MoveWindow(stop, 524, buttonY, 100, 34, TRUE);
         if (HWND exportButton = GetDlgItem(window_, kExport)) MoveWindow(exportButton, 636, buttonY, 164, 34, TRUE);
-        if (calibrationCard_) MoveWindow(calibrationCard_, margin, 232, contentWidth, 130, TRUE);
+        if (calibrationCard_) MoveWindow(calibrationCard_, margin, 232, contentWidth, 176, TRUE);
+        if (scrollbarCandidateCombo_) {
+            MoveWindow(scrollbarCandidateCombo_, 210, 324, 540, 280, TRUE);
+        }
+        if (HWND setCandidate = GetDlgItem(window_, kSetScrollbarCandidate)) {
+            MoveWindow(setCandidate, 762, 323, 144, 34, TRUE);
+        }
         if (HWND saveTemplate = GetDlgItem(window_, kSaveTemplate)) {
-            MoveWindow(saveTemplate, 630, 326, 132, 30, TRUE);
+            MoveWindow(saveTemplate, 630, 366, 132, 30, TRUE);
         }
         if (HWND loadTemplate = GetDlgItem(window_, kLoadTemplate)) {
-            MoveWindow(loadTemplate, 774, 326, 132, 30, TRUE);
+            MoveWindow(loadTemplate, 774, 366, 132, 30, TRUE);
         }
-        if (statusCard_) MoveWindow(statusCard_, margin, 376, contentWidth, 112, TRUE);
-        if (status_) MoveWindow(status_, 42, 443, std::max(400, width - 84), 36, TRUE);
+        if (statusCard_) MoveWindow(statusCard_, margin, 422, contentWidth, 112, TRUE);
+        if (status_) MoveWindow(status_, 42, 489, std::max(400, width - 84), 36, TRUE);
         if (previewCard_) MoveWindow(previewCard_, margin, previewTop, contentWidth, previewHeight, TRUE);
         if (previewCanvas_) MoveWindow(previewCanvas_, 36, previewTop + 42,
                                        std::max(200, width - 72), std::max(100, previewHeight - 54), TRUE);
@@ -515,6 +568,34 @@ private:
     static std::string rectDescription(const Rect& rect) {
         return "x=" + std::to_string(rect.x) + " y=" + std::to_string(rect.y) +
                " w=" + std::to_string(rect.width) + " h=" + std::to_string(rect.height);
+    }
+
+    int maximumJumpPercent() const {
+        if (!maximumJumpSlider_) return kDefaultJumpPercent;
+        return std::clamp(static_cast<int>(SendMessageW(
+            maximumJumpSlider_, TBM_GETPOS, 0, 0)), kMinimumJumpPercent, kMaximumJumpPercent);
+    }
+
+    void updateMaximumJumpLabel() const {
+        if (!maximumJumpValue_) return;
+        const int jump = maximumJumpPercent();
+        const std::wstring text = std::to_wstring(jump) + L"% (" +
+            std::to_wstring(100 - jump) + L"% overlap)";
+        SetWindowTextW(maximumJumpValue_, text.c_str());
+    }
+
+    static std::wstring timestampedCaptureFilename() {
+        SYSTEMTIME localTime{};
+        GetLocalTime(&localTime);
+        std::wostringstream filename;
+        filename << std::setfill(L'0')
+                 << std::setw(4) << localTime.wYear << L'-'
+                 << std::setw(2) << localTime.wMonth << L'-'
+                 << std::setw(2) << localTime.wDay << L'_'
+                 << std::setw(2) << localTime.wHour << L'-'
+                 << std::setw(2) << localTime.wMinute << L'-'
+                 << std::setw(2) << localTime.wSecond << L".png";
+        return filename.str();
     }
 
     static std::string windowDescription(HWND window) {
@@ -618,6 +699,7 @@ private:
         }
         scrollbarCandidates_.clear();
         selectedScrollbarCandidate_.reset();
+        refreshScrollbarCandidateCombo();
         scrollbarSide_ = profile.scrollbar.side;
         setRect(viewportEdits_, profile.content);
         setRect(trackEdits_, profile.scrollbar.track);
@@ -694,16 +776,67 @@ private:
         return true;
     }
 
+    void refreshScrollbarCandidateCombo() {
+        if (!scrollbarCandidateCombo_) return;
+        SendMessageW(scrollbarCandidateCombo_, CB_RESETCONTENT, 0, 0);
+        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
+            const auto& candidate = scrollbarCandidates_[index];
+            const int confidence = static_cast<int>(std::lround(
+                candidate.observation.confidence * 100.0F));
+            std::wostringstream entry;
+            entry << L'#' << index + 1 << L' '
+                  << (candidate.config.side == ScrollbarSide::Left ? L"Left" : L"Right")
+                  << L" | x=" << candidate.config.track.x
+                  << L" y=" << candidate.config.track.y
+                  << L" " << candidate.config.track.width << L'x' << candidate.config.track.height
+                  << L" | confidence " << confidence << L"% | rank "
+                  << std::fixed << std::setprecision(3) << candidate.autoDetectionScore;
+            SendMessageW(scrollbarCandidateCombo_, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(entry.str().c_str()));
+        }
+        if (selectedScrollbarCandidate_ &&
+            *selectedScrollbarCandidate_ < scrollbarCandidates_.size()) {
+            SendMessageW(scrollbarCandidateCombo_, CB_SETCURSEL,
+                         static_cast<WPARAM>(*selectedScrollbarCandidate_), 0);
+        } else if (!scrollbarCandidates_.empty()) {
+            SendMessageW(scrollbarCandidateCombo_, CB_SETCURSEL, 0, 0);
+        }
+        if (HWND setButton = GetDlgItem(window_, kSetScrollbarCandidate)) {
+            EnableWindow(setButton, !scrollbarCandidates_.empty());
+        }
+    }
+
     void selectScrollbarCandidate(std::size_t index, bool announce) {
         if (index >= scrollbarCandidates_.size()) return;
         selectedScrollbarCandidate_ = index;
+        if (scrollbarCandidateCombo_) {
+            SendMessageW(scrollbarCandidateCombo_, CB_SETCURSEL,
+                         static_cast<WPARAM>(index), 0);
+        }
         const auto& candidate = scrollbarCandidates_[index];
         scrollbarSide_ = candidate.config.side;
         logger_.info("calibration", "selected scrollbar candidate #" + std::to_string(index + 1) +
                      " track{" + rectDescription(candidate.config.track) + "} thumb{" +
                      rectDescription(candidate.observation.thumb) + "} confidence=" +
                      std::to_string(candidate.observation.confidence));
-        setRect(trackEdits_, scrollbarCandidates_[index].config.track);
+        const Rect& track = candidate.config.track;
+        setRect(trackEdits_, track);
+        if (!preview_.empty()) {
+            // Selecting a scrollbar establishes the scrollable panel as one
+            // atomic calibration operation. This is the same content-box
+            // derivation used for the initial best candidate: the viewport is
+            // vertically bounded by the track and stops before the scrollbar.
+            Rect viewport{0, track.y, preview_.cols, track.height};
+            if (candidate.config.side == ScrollbarSide::Right) {
+                viewport.width = std::max(16, track.x);
+            } else {
+                viewport.x = std::min(preview_.cols - 16, track.right());
+                viewport.width = std::max(16, preview_.cols - viewport.x);
+            }
+            setRect(viewportEdits_, viewport);
+            logger_.info("calibration", "selected candidate also set viewport{" +
+                         rectDescription(viewport) + "}");
+        }
         InvalidateRect(previewCanvas_, nullptr, FALSE);
         if (announce) {
             const int confidence = static_cast<int>(std::lround(
@@ -711,6 +844,17 @@ private:
             setStatus(L"Selected scrollbar (confidence " + std::to_wstring(confidence) +
                       L"%). Drag the orange rectangle to fine-tune it if needed.");
         }
+    }
+
+    void setScrollbarCandidateFromCombo() {
+        if (!scrollbarCandidateCombo_) return;
+        const LRESULT selected = SendMessageW(scrollbarCandidateCombo_, CB_GETCURSEL, 0, 0);
+        if (selected == CB_ERR || selected < 0 ||
+            static_cast<std::size_t>(selected) >= scrollbarCandidates_.size()) {
+            setStatus(L"Run auto-detection and choose a scrollbar candidate first.");
+            return;
+        }
+        selectScrollbarCandidate(static_cast<std::size_t>(selected), true);
     }
 
     [[nodiscard]] std::optional<std::size_t> scrollbarCandidateAt(const POINT& point,
@@ -761,33 +905,11 @@ private:
         const Rect track = readRect(trackEdits_);
         const RECT viewportRect = scaledRect(viewport, *transform);
         const RECT trackRect = scaledRect(track, *transform);
-        HPEN candidatePen = CreatePen(PS_DOT, 1, RGB(40, 180, 255));
         HPEN viewportPen = CreatePen(PS_SOLID, 2, RGB(50, 220, 90));
         HPEN trackPen = CreatePen(PS_SOLID, 2, RGB(255, 170, 30));
-        HGDIOBJ oldPen = SelectObject(dc, candidatePen);
+        HGDIOBJ oldPen = SelectObject(dc, viewportPen);
         HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
 
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(40, 180, 255));
-        for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
-            if (selectedScrollbarCandidate_ && *selectedScrollbarCandidate_ == index) continue;
-            const RECT candidateRect = scaledRect(scrollbarCandidates_[index].config.track, *transform);
-            Rectangle(dc, candidateRect.left, candidateRect.top,
-                      candidateRect.right, candidateRect.bottom);
-            const int confidence = static_cast<int>(std::lround(
-                scrollbarCandidates_[index].observation.confidence * 100.0F));
-            const std::wstring label = L"#" + std::to_wstring(index + 1) + L" " +
-                                       std::to_wstring(confidence) + L"%";
-            const LONG labelTop = std::min(candidateRect.bottom - 20,
-                                           candidateRect.top + 3 +
-                                               static_cast<LONG>(index % 12) * 18);
-            RECT labelRect{candidateRect.left + 3, labelTop,
-                           candidateRect.right + 100, labelTop + 19};
-            DrawTextW(dc, label.c_str(), -1, &labelRect,
-                      DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-        }
-
-        SelectObject(dc, viewportPen);
         Rectangle(dc, viewportRect.left, viewportRect.top, viewportRect.right, viewportRect.bottom);
         SelectObject(dc, trackPen);
         Rectangle(dc, trackRect.left, trackRect.top, trackRect.right, trackRect.bottom);
@@ -795,7 +917,6 @@ private:
         SelectObject(dc, oldPen);
         DeleteObject(viewportPen);
         DeleteObject(trackPen);
-        DeleteObject(candidatePen);
 
         SetTextColor(dc, RGB(50, 220, 90));
         RECT viewportLabel{viewportRect.left + 4, viewportRect.top + 3, viewportRect.right - 4, viewportRect.top + 22};
@@ -959,6 +1080,7 @@ private:
         preview_.release();
         scrollbarCandidates_.clear();
         selectedScrollbarCandidate_.reset();
+        refreshScrollbarCandidateCombo();
         session_.reset();
         InvalidateRect(previewCanvas_, nullptr, TRUE);
         source_ = createFrameSource(target_);
@@ -1002,23 +1124,12 @@ private:
                          std::to_string(candidate.observation.confidence) + " selection_score=" +
                          std::to_string(candidate.autoDetectionScore));
         }
-        // Keep the preview unambiguous: automatic ranking selects exactly one
-        // scrollbar. The full list above is diagnostics-only.
-        if (!detectedCandidates.empty()) scrollbarCandidates_.push_back(detectedCandidates.front());
+        // Keep every distinct result available in the dropdown, while the
+        // preview itself draws only the currently selected rectangle.
+        scrollbarCandidates_ = detectedCandidates;
+        refreshScrollbarCandidateCombo();
         if (!scrollbarCandidates_.empty()) {
             selectScrollbarCandidate(0, false);
-            // The content viewport must exclude the scrollbar strip; baking
-            // the thumb into every strip leaves a jumping column through the
-            // entire capture.
-            const Rect& track = scrollbarCandidates_.front().config.track;
-            Rect viewport{0, track.y, preview_.cols, track.height};
-            if (track.x + track.width / 2 >= preview_.cols / 2) {
-                viewport.width = std::max(16, track.x);
-            } else {
-                viewport.x = std::min(preview_.cols - 16, track.right());
-                viewport.width = std::max(16, preview_.cols - viewport.x);
-            }
-            setRect(viewportEdits_, viewport);
         } else {
             setRect(viewportEdits_, {0, 0, preview_.cols, preview_.rows});
             setRect(trackEdits_, {std::max(0, preview_.cols - 18), 0, 18, preview_.rows});
@@ -1035,7 +1146,8 @@ private:
                 scrollbarCandidates_.front().observation.confidence * 100.0F));
             message += L"The best scrollbar was selected (confidence " +
                        std::to_wstring(confidence) +
-                       L"%). Only the selected scrollbar is shown.";
+                       L"%). " + std::to_wstring(scrollbarCandidates_.size()) +
+                       L" candidate(s) are available in the dropdown; only the selected scrollbar is shown.";
         } else {
             message += L"No scrollbar candidate found; set the orange track manually.";
         }
@@ -1052,6 +1164,7 @@ private:
         scrollbarCandidates_.clear();
         selectedScrollbarCandidate_.reset();
         if (detectedCandidates.empty()) {
+            refreshScrollbarCandidateCombo();
             logger_.warning("calibration", "auto-detect found no scrollbar candidate");
             setStatus(L"No scrollbar candidate was found. Set the track rectangle manually.");
             InvalidateRect(previewCanvas_, nullptr, FALSE);
@@ -1065,13 +1178,15 @@ private:
                          std::to_string(candidate.observation.confidence) + " selection_score=" +
                          std::to_string(candidate.autoDetectionScore));
         }
-        scrollbarCandidates_.push_back(detectedCandidates.front());
+        scrollbarCandidates_ = detectedCandidates;
+        refreshScrollbarCandidateCombo();
         selectScrollbarCandidate(0, false);
         const int confidence = static_cast<int>(std::lround(
             scrollbarCandidates_.front().observation.confidence * 100.0F));
         setStatus(L"The best scrollbar was selected (confidence " +
                   std::to_wstring(confidence) +
-                  L"%). Only the orange selected rectangle is shown; drag it to adjust.");
+                  L"%). Choose any of the " + std::to_wstring(scrollbarCandidates_.size()) +
+                  L" candidates in the dropdown and click Set selected, or drag the orange rectangle.");
     }
 
     void startCapture() {
@@ -1125,9 +1240,14 @@ private:
         options.scrollbar.track = readRect(trackEdits_);
         options.scrollbar.side = scrollbarSide_;
         options.scrollbar.enabled = true;
+        const int maximumJump = maximumJumpPercent();
+        options.estimator.minimumOverlapRatio =
+            static_cast<float>(100 - maximumJump) / 100.0F;
         logger_.info("capture", "start options viewport{" + rectDescription(options.viewport) +
                      "} scrollbar{" + rectDescription(options.scrollbar.track) + "} preview=" +
-                     std::to_string(preview_.cols) + "x" + std::to_string(preview_.rows));
+                     std::to_string(preview_.cols) + "x" + std::to_string(preview_.rows) +
+                     " maximum_jump_percent=" + std::to_string(maximumJump) +
+                     " minimum_overlap_ratio=" + std::to_string(options.estimator.minimumOverlapRatio));
         if (!options.viewport.valid() || !options.scrollbar.track.valid()) {
             logger_.error("capture", "start rejected because calibration rectangle is invalid");
             setStatus(L"Viewport and scrollbar track must have positive width and height.");
@@ -1144,12 +1264,13 @@ private:
                          rectDescription(session_.viewport()) + "}");
         }
         capturing_ = true;
+        EnableWindow(maximumJumpSlider_, FALSE);
         captureTickCount_ = 0;
         transientMissCount_ = 0;
         logger_.info("capture", "capture started");
         SetTimer(window_, kTimer, kTimerPeriodMs, nullptr);
-        setStatus(L"Capturing. Scroll the target down manually; no input is injected. "
-                  L"Prefer small mouse-wheel notches or the down arrow.");
+        setStatus(L"Capturing at up to 60 FPS. Scroll the target down manually; no input is injected. "
+                  L"The selected maximum jump is " + std::to_wstring(maximumJump) + L"% of the viewport.");
     }
 
     void stopCapture() {
@@ -1157,6 +1278,7 @@ private:
         if (!capturing_ && session_.state() != SessionState::Paused &&
             session_.state() != SessionState::Capturing) return;
         capturing_ = false;
+        EnableWindow(maximumJumpSlider_, TRUE);
         if (session_.finish()) {
             logger_.info("capture", "capture finalized accepted_frames=" + std::to_string(session_.acceptedFrames()) +
                          " output_rows=" + std::to_string(session_.outputRows()));
@@ -1196,6 +1318,7 @@ private:
             sawFrame = true;
             if (frame->width() != preview_.cols || frame->height() != preview_.rows) {
                 capturing_ = false;
+                EnableWindow(maximumJumpSlider_, TRUE);
                 KillTimer(window_, kTimer);
                 setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
                 logger_.warning("capture", "capture frame dimensions changed from=" + std::to_string(preview_.cols) +
@@ -1228,6 +1351,7 @@ private:
             }
             if (lastUpdate.paused) {
                 capturing_ = false;
+                EnableWindow(maximumJumpSlider_, TRUE);
                 setStatus(std::wstring(L"PAUSED: ") + widen(lastUpdate.message));
                 return;
             }
@@ -1241,11 +1365,13 @@ private:
             }
             if (!IsWindow(target_)) {
                 capturing_ = false;
+                EnableWindow(maximumJumpSlider_, TRUE);
                 KillTimer(window_, kTimer);
                 setStatus(L"The target window closed; click Stop to finalize the valid prefix.");
                 logger_.error("capture", "target window closed during capture");
             } else if (source_->width() != preview_.cols || source_->height() != preview_.rows) {
                 capturing_ = false;
+                EnableWindow(maximumJumpSlider_, TRUE);
                 KillTimer(window_, kTimer);
                 setStatus(L"Target size changed during capture; click Stop to finalize the valid prefix or recapture.");
                 logger_.warning("capture", "target resized or source dimensions changed during capture");
@@ -1268,7 +1394,7 @@ private:
         // so the capture keeps running while the user recovers the overlap.
         if (lastUpdate.rejected) {
             setStatus(L"RECOVERING: " + widen(lastUpdate.message) +
-                      L" (mouse wheel may be jumping too far — try slower notches or the down arrow)");
+                      L" (the jump exceeded the retained overlap; raise Maximum single-frame jump or scroll back slightly)");
         }
     }
 
@@ -1362,7 +1488,9 @@ private:
             setStatus(L"Capture and stop a session before exporting.");
             return;
         }
-        wchar_t filename[MAX_PATH] = L"stitched_capture.png";
+        wchar_t filename[MAX_PATH]{};
+        const std::wstring defaultFilename = timestampedCaptureFilename();
+        wcsncpy_s(filename, defaultFilename.c_str(), _TRUNCATE);
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
         dialog.lpstrFilter = L"PNG image (*.png)\0*.png\0JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
@@ -1404,6 +1532,7 @@ private:
         case kRefresh: refreshTargets(); break;
         case kPreview: capturePreview(); break;
         case kAutoDetect: autoDetectScrollbar(); break;
+        case kSetScrollbarCandidate: setScrollbarCandidateFromCombo(); break;
         case kStart: startCapture(); break;
         case kStop: stopCapture(); break;
         case kExport: exportImage(); break;
@@ -1431,6 +1560,8 @@ private:
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_BAR_CLASSES};
+    InitCommonControlsEx(&commonControls);
 #ifdef UNIVERSAL_STITCHER_HAS_WGC
     try {
         winrt::init_apartment(winrt::apartment_type::single_threaded);

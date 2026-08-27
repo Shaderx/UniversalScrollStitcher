@@ -14,7 +14,7 @@ Windows 10 or 11 x64 is required. Some protected or hardware-overlay surfaces ca
 
 The stitcher combines two signals:
 
-- The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate. Automatic ranking favors thin, neutral-gray scrollbar thumbs on a contrasting track and shows only the best match.
+- The scrollbar thumb establishes movement, direction, top/bottom state, and a displacement estimate. Full-window automatic detection checks several thin track widths, ranks neutral-gray scrollbar thumbs highly, and exposes every distinct result in a dropdown while showing only the selected match in the preview.
 - Frame-to-frame pixel registration finds the exact vertical displacement and rejects ambiguous matches.
 - The scrollbar's vertical travel range masks fixed headers and footers. Frame-to-frame motion masks also exclude fixed sidebars, toolbars, overlays, and other static pixels inside a broader content rectangle from registration and seam selection.
 - A low-difference row inside the overlap becomes the seam.
@@ -25,10 +25,12 @@ The user always scrolls manually. The app only observes captured frames and neve
 ## Use
 
 1. Select a top-level target window. Click **Refresh** if it was opened after the stitcher.
-2. Click **Capture preview**. The preview scales to the app window, continues updating from the target at up to 30 Hz, and shows the single highest-ranked scrollbar in orange. The initial green content area uses the scrollbar's vertical track, avoiding fixed chrome above and below a centered scrolling panel.
-3. Drag inside the green content or orange scrollbar rectangle to move it, or drag an edge to resize it. The content area should exclude the scrollbar itself. Use **Save template** to write both rectangles to a versioned `.ussconfig` file. Use **Load template** to restore them later; if the target dimensions changed, both rectangles are scaled to fit the current preview.
-4. Click **Start**, switch to the target, and manually scroll downward. Prefer small mouse-wheel notches or the down arrow; large wheel bursts can jump past the visible overlap. Starting mid-document is allowed; scroll back to the top first only when you want a full-page capture.
-5. After the last content is visible, click **Stop**, then **Export PNG/JPEG**.
+2. Click **Capture preview**. The preview scales to the app window, continues updating from the target at up to 60 Hz, and shows the highest-ranked scrollbar in orange. Detection covers the full target window, including scrollable panels in the middle of a game or split-pane application.
+3. If the orange rectangle is wrong, choose another entry under **Detected scrollbars** and click **Set selected**. Each entry includes its coordinates, size, detector confidence, and ranking score. Setting a candidate updates both the orange scrollbar and green content viewport together; only the selected candidate is drawn, keeping the preview uncluttered.
+4. Drag inside the green content or orange scrollbar rectangle to move it, or drag an edge to resize it. The content area should exclude the scrollbar itself. Use **Save template** to write both rectangles to a versioned `.ussconfig` file. Use **Load template** to restore them later; if the target dimensions changed, both rectangles are scaled to fit the current preview.
+5. Set **Maximum single-frame jump** to the largest gap the matcher may accept. The 90% default retains 10% of the viewport as visual overlap; raise it toward 95% for faster scrolling, or lower it when repetitive content needs more protection against a false match.
+6. Click **Start**, switch to the target, and manually scroll downward at a comfortable pace. The 60 Hz capture loop and deeper frame queue preserve intermediate views during short wheel bursts, while the matcher can directly recover a jump up to the selected limit. Starting mid-document is allowed; scroll back to the top first only when you want a full-page capture.
+7. After the last content is visible, click **Stop**, then **Export PNG/JPEG**. The suggested filename uses local time in `YYYY-MM-DD_HH-mm-ss` form so every capture is naturally ordered and includes seconds.
 
 If a scroll briefly loses visual overlap, the status shows **RECOVERING** and the session stays live: scroll back up slightly until the overlap returns. Only a sustained failure pauses the session so you can stop and export the valid prefix. Overlay scrollbars that fade while idle are treated the same way and do not end the capture.
 
@@ -52,7 +54,7 @@ latest portable-release credit visible in the footer.
 
 ## Portable release pipeline
 
-The GitHub Actions workflow builds and tests a statically linked x64 Release executable. Each successful push to `main` uploads a `UniversalScrollStitcher-windows-x64` artifact and automatically publishes its ZIP as the latest GitHub Release under a `build-N` tag. Pushing a version tag such as `v0.1.0` publishes a named release instead; tags containing a suffix such as `v0.1.0-rc.1` are marked as prereleases.
+The GitHub Actions workflow builds and tests a statically linked x64 Release executable. Each successful push to `main` uploads a `UniversalScrollStitcher-windows-x64` artifact and automatically publishes its ZIP as the latest GitHub Release under a `build-N` tag. Pushing a version tag such as `v1.0.0` publishes a named release instead; tags containing a suffix such as `v1.0.0-rc.1` are marked as prereleases.
 
 To make the same portable folder locally:
 
@@ -89,7 +91,7 @@ Dependencies are declared in [`vcpkg.json`](vcpkg.json). If C++/WinRT headers ar
 
 - One vertical, downward-scrolling viewport per session
 - The viewport size must remain constant during capture
-- Large wheel jumps that outrun the visible overlap need a slower notch or a small upward scroll to recover; sustained loss pauses the session
+- A jump beyond the selected limit, or one that leaves no distinct visual overlap, needs a small upward scroll to recover; sustained loss pauses the session
 - Animated, parallax, rapidly changing, zoomed, or horizontally scrolling content may not stitch reliably
 - Custom scrollbars with little contrast may require manual track adjustment
 - JPEG exports taller than the Windows codec limit (~65,000 rows) are split into numbered parts; PNG stays a single file unless the capture is extraordinarily tall; PNG is preferred for UI text
