@@ -105,6 +105,7 @@ public:
     }
 
 private:
+    friend struct PreviewInteractionTests;
     static constexpr UINT_PTR kTimer = 1;
     // Poll the WGC queue at roughly 60 Hz so accelerated wheel bursts retain
     // more intermediate views. The source itself controls the actual frame
@@ -944,10 +945,9 @@ private:
         const Rect track = readRect(trackEdits_);
         int trackEdges = EdgeNone;
         int viewportEdges = EdgeNone;
-        if (const auto candidate = scrollbarCandidateAt(imagePoint, radius)) {
-            selectScrollbarCandidate(*candidate, true);
-            return;
-        }
+        // Visible calibration rectangles own their drag handles, even when
+        // another detected scrollbar overlaps the hit area. Candidate picking
+        // must not replace the selection before a move/resize can begin.
         const bool hitTrack = hitRect(track, imagePoint, radius, trackEdges);
         const bool hitViewport = hitRect(viewport, imagePoint, radius, viewportEdges);
         if (hitTrack) {
@@ -960,6 +960,9 @@ private:
             dragOriginal_ = viewport;
         } else {
             dragTarget_ = CanvasTarget::None;
+            if (const auto candidate = scrollbarCandidateAt(imagePoint, radius)) {
+                selectScrollbarCandidate(*candidate, true);
+            }
             return;
         }
         dragStartImage_ = imagePoint;

@@ -119,6 +119,13 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
     target_include_directories(stitch_core_tests PRIVATE include)
     add_test(NAME stitch_core_tests COMMAND stitch_core_tests)
     if (WIN32)
+        add_executable(stitch_preview_tests tests/preview_tests.cpp
+            src/capture/WindowCapture.cpp src/capture/GraphicsCaptureSource.cpp)
+        target_link_libraries(stitch_preview_tests PRIVATE stitch_core stitch_export diagnostic_logger
+            user32 gdi32 shcore dwmapi comdlg32 comctl32 shell32)
+        target_compile_definitions(stitch_preview_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+        copy_opencv_runtime(stitch_preview_tests)
+        add_test(NAME stitch_preview_tests COMMAND stitch_preview_tests)
         add_executable(stitch_logger_tests tests/logger_tests.cpp)
         target_link_libraries(stitch_logger_tests PRIVATE diagnostic_logger)
         target_include_directories(stitch_logger_tests PRIVATE include)
