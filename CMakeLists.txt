@@ -119,7 +119,12 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
     target_link_libraries(stitch_core_tests PRIVATE stitch_core)
     target_include_directories(stitch_core_tests PRIVATE include)
     add_test(NAME stitch_core_tests COMMAND stitch_core_tests)
+    add_executable(stitch_scrollbar_corpus_tests tests/scrollbar_corpus_tests.cpp)
+    target_link_libraries(stitch_scrollbar_corpus_tests PRIVATE stitch_core)
+    add_test(NAME stitch_scrollbar_corpus_tests COMMAND stitch_scrollbar_corpus_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/umamusume")
     if (WIN32)
+        copy_opencv_runtime(stitch_scrollbar_corpus_tests)
         add_executable(stitch_preview_tests tests/preview_tests.cpp
             src/capture/WindowCapture.cpp src/capture/GraphicsCaptureSource.cpp)
         target_link_libraries(stitch_preview_tests PRIVATE stitch_core stitch_export diagnostic_logger

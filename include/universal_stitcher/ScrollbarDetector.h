@@ -27,9 +27,10 @@ struct ScrollbarObservation {
 struct ScrollbarCandidate {
     ScrollbarConfig config;
     ScrollbarObservation observation;
-    // Ranking combines motion-thumb contrast, neutral scrollbar color, edge
-    // proximity, and the detector's run confidence. The GUI uses it to order
-    // every distinct candidate in its manual selection list.
+    // Ranking combines visual thumb contrast, neutral scrollbar color,
+    // track coverage, and the detector's run confidence. The GUI uses it to order
+    // every distinct candidate in its manual selection list. This heuristic
+    // match score is not a calibrated probability of detection or user intent.
     float autoDetectionScore = 0.0F;
 };
 

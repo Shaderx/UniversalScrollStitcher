@@ -769,15 +769,13 @@
         SendMessageW(scrollbarCandidateCombo_, CB_RESETCONTENT, 0, 0);
         for (std::size_t index = 0; index < scrollbarCandidates_.size(); ++index) {
             const auto& candidate = scrollbarCandidates_[index];
-            const int confidence = static_cast<int>(std::lround(
-                candidate.observation.confidence * 100.0F));
             std::wostringstream entry;
-            entry << L'#' << index + 1 << L' '
+            entry << L"Rank " << index + 1 << L" of " << scrollbarCandidates_.size() << L' '
                   << (candidate.config.side == ScrollbarSide::Left ? L"Left" : L"Right")
                   << L" | x=" << candidate.config.track.x
                   << L" y=" << candidate.config.track.y
                   << L" " << candidate.config.track.width << L'x' << candidate.config.track.height
-                  << L" | confidence " << confidence << L"% | rank "
+                  << L" | match score "
                   << std::fixed << std::setprecision(3) << candidate.autoDetectionScore;
             SendMessageW(scrollbarCandidateCombo_, CB_ADDSTRING, 0,
                          reinterpret_cast<LPARAM>(entry.str().c_str()));
@@ -827,10 +825,12 @@
         refreshWorkflow();
         InvalidateRect(previewCanvas_, nullptr, FALSE);
         if (announce) {
-            const int confidence = static_cast<int>(std::lround(
-                scrollbarCandidates_[index].observation.confidence * 100.0F));
-            setStatus(L"Selected scrollbar (confidence " + std::to_wstring(confidence) +
-                      L"%). Choose Scrollbar in the preview toolbar to edit it.");
+            std::wostringstream message;
+            message << L"Selected scrollbar: rank " << index + 1 << L" of "
+                    << scrollbarCandidates_.size() << L", match score "
+                    << std::fixed << std::setprecision(3) << candidate.autoDetectionScore
+                    << L". Choose Scrollbar in the preview to edit it.";
+            setStatus(message.str());
         }
     }
 
@@ -874,9 +874,9 @@
             : L"Drag a new capture area. Escape cancels.";
         else if (trackTool) {
             hint = selectedScrollbarCandidate_
-                ? L"Scrollbar " + std::to_wstring(*selectedScrollbarCandidate_ + 1) + L" of " + std::to_wstring(scrollbarCandidates_.size()) + L". "
+                ? L"Rank " + std::to_wstring(*selectedScrollbarCandidate_ + 1) + L" of " + std::to_wstring(scrollbarCandidates_.size()) + L" (best first). "
                 : L"Manual scrollbar. ";
-            hint += L"Select the full travel track. Wheel: zoom / Space + drag: pan.";
+            hint += L"Select full track. Wheel: zoom / Space + drag: pan.";
         } else hint = L"Drag to move; use handles to resize. Wheel: zoom / Space + drag: pan.";
         setUiText(previewToolbarLabel_, hint.c_str());
         for (HWND button : {previewToolCaptureButton_, previewToolScrollbarButton_, previewDrawButton_, previewUndoButton_})
@@ -996,7 +996,8 @@
         SetTextColor(item->hDC, ink);
         wchar_t caption[96]{};
         GetWindowTextW(item->hwndItem, caption, static_cast<int>(std::size(caption)));
-        DrawTextW(item->hDC, caption, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(item->hDC, caption, -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(item->hDC, oldFont);
         if (item->itemState & ODS_FOCUS) {
             InflateRect(&rect, -4, -4);
@@ -1025,7 +1026,7 @@
         previewCanvas_ = CreateWindowExW(
             WS_EX_TOOLWINDOW, className,
             L"Preview & calibration",
-            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
             900, 680, owner ? owner : window_, nullptr, instance_, this);
         if (previewCanvas_) {
             ShowWindow(previewCanvas_, SW_SHOW);
@@ -1106,6 +1107,29 @@
     }
 
     void paintPreview(HWND canvas, HDC dc) const {
+        RECT client{};
+        GetClientRect(canvas, &client);
+        if (client.right <= 0 || client.bottom <= 0) return;
+
+        // Compose the image, dimming and handles before touching the window.
+        // Painting the clear directly to the window exposes a blank frame on
+        // every live refresh or drag, even when WM_ERASEBKGND is suppressed.
+        HDC buffer = CreateCompatibleDC(dc);
+        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(dc, client.right, client.bottom) : nullptr;
+        HGDIOBJ previous = bitmap ? SelectObject(buffer, bitmap) : nullptr;
+        if (previous && previous != HGDI_ERROR) {
+            paintPreviewContents(canvas, buffer);
+            BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
+            SelectObject(buffer, previous);
+        } else {
+            // Preserve a usable preview if GDI cannot allocate the buffer.
+            paintPreviewContents(canvas, dc);
+        }
+        if (bitmap) DeleteObject(bitmap);
+        if (buffer) DeleteDC(buffer);
+    }
+
+    void paintPreviewContents(HWND canvas, HDC dc) const {
         RECT client{};
         GetClientRect(canvas, &client);
         HBRUSH background = CreateSolidBrush(RGB(20, 23, 29));

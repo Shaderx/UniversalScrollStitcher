@@ -151,7 +151,7 @@
         const int previewX = std::clamp(mainBounds.right + 12, monitor.rcWork.left,
                                         monitor.rcWork.right - previewWidth);
         previewCanvas_ = CreateWindowExW(WS_EX_TOOLWINDOW, L"UniversalScrollStitcherPreview",
-            L"Capture area - Scroll Stitcher", WS_OVERLAPPEDWINDOW,
+            L"Capture area - Scroll Stitcher", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             previewX, monitor.rcWork.top + std::max(0L, (monitor.rcWork.bottom - monitor.rcWork.top - previewHeight) / 2),
             previewWidth, previewHeight, window_, nullptr, instance_, this);
         DwmSetWindowAttribute(previewCanvas_, 20, &dark, sizeof(dark));
@@ -171,7 +171,7 @@
     void layoutControls(int clientWidth, int clientHeight) {
         if (!stageTitle_) return;
         const int width = MulDiv(clientWidth, 96, uiDpi_);
-        const int inner = std::max(400, width - 48);
+        const int inner = std::max(0, width - 48);
         const UiStage stage = uiStage();
         const bool setup = stage == UiStage::Choose || stage == UiStage::Calibrate;
         const bool calibrated = stage == UiStage::Calibrate;
@@ -228,6 +228,9 @@
         const int footerY = setup ? (advanced ? detailY + 287 : settingsY + 55) : 581;
         place(footer_, 24, footerY + 7, inner - 146, 22);
         place(latestReleaseLink_, width - 165, footerY, 141, 32);
+        // Resizing and stage changes move transparent labels and owner-drawn
+        // buttons. Erase their old positions as well as repainting the controls.
+        InvalidateRect(window_, nullptr, TRUE);
     }
 
     void refreshWorkflow() {
@@ -353,7 +356,8 @@
         SetTextColor(item->hDC, text);
         wchar_t caption[128]{};
         GetWindowTextW(item->hwndItem, caption, static_cast<int>(std::size(caption)));
-        DrawTextW(item->hDC, caption, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(item->hDC, caption, -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(item->hDC, oldFont);
         if (item->itemState & ODS_FOCUS) {
             InflateRect(&rect, -4, -4);

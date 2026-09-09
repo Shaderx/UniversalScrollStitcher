@@ -129,9 +129,28 @@ public:
         klass.lpszClassName = L"UniversalScrollStitcherWindow";
         if (!RegisterClassExW(&klass)) return false;
         window_ = CreateWindowExW(0, klass.lpszClassName, L"Universal Scroll Stitcher",
-                                  WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                   540, 800, nullptr, nullptr, instance, this);
         if (!window_) return false;
+        // CreateWindow's dimensions are physical pixels in a per-monitor-DPI
+        // process. Size the initial client area using the window's actual DPI
+        // before showing it, so scaled controls do not open in a 96-DPI shell.
+        RECT initial{0, 0, px(520), px(752)};
+        AdjustWindowRectExForDpi(&initial, WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+                                FALSE, 0, uiDpi_);
+        MONITORINFO monitor{sizeof(monitor)};
+        if (GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            RECT bounds{};
+            GetWindowRect(window_, &bounds);
+            const int width = std::min<int>(initial.right - initial.left,
+                                           monitor.rcWork.right - monitor.rcWork.left);
+            const int height = std::min<int>(initial.bottom - initial.top,
+                                            monitor.rcWork.bottom - monitor.rcWork.top);
+            SetWindowPos(window_, nullptr,
+                std::clamp<int>(bounds.left, monitor.rcWork.left, monitor.rcWork.right - width),
+                std::clamp<int>(bounds.top, monitor.rcWork.top, monitor.rcWork.bottom - height),
+                width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         return true;
@@ -289,9 +308,24 @@ private:
             uiDpi_ = HIWORD(wParam);
             updateFonts();
             const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
-            SetWindowPos(window_, nullptr, suggested->left, suggested->top,
-                suggested->right - suggested->left, suggested->bottom - suggested->top,
+            RECT minimum{0, 0, px(kMinimumClientWidth), px(kMinimumClientHeight)};
+            AdjustWindowRectExForDpi(&minimum, WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+                                    FALSE, 0, uiDpi_);
+            RECT bounds = *suggested;
+            int width = std::max<int>(bounds.right - bounds.left, minimum.right - minimum.left);
+            int height = std::max<int>(bounds.bottom - bounds.top, minimum.bottom - minimum.top);
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                width = std::min<int>(width, monitor.rcWork.right - monitor.rcWork.left);
+                height = std::min<int>(height, monitor.rcWork.bottom - monitor.rcWork.top);
+                bounds.left = std::clamp<int>(bounds.left, monitor.rcWork.left, monitor.rcWork.right - width);
+                bounds.top = std::clamp<int>(bounds.top, monitor.rcWork.top, monitor.rcWork.bottom - height);
+            }
+            SetWindowPos(window_, nullptr, bounds.left, bounds.top, width, height,
                 SWP_NOZORDER | SWP_NOACTIVATE);
+            RECT client{};
+            GetClientRect(window_, &client);
+            layoutControls(client.right, client.bottom);
             return 0;
         }
         case WM_HSCROLL:
@@ -308,8 +342,8 @@ private:
             if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
             RECT desiredClient{0, 0, MulDiv(kMinimumClientWidth, dpi, 96), MulDiv(kMinimumClientHeight, dpi, 96)};
             RECT desiredWindow = desiredClient;
-            if (!AdjustWindowRectExForDpi(&desiredWindow, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi)) {
-                AdjustWindowRectEx(&desiredWindow, WS_OVERLAPPEDWINDOW, FALSE, 0);
+            if (!AdjustWindowRectExForDpi(&desiredWindow, WS_OVERLAPPEDWINDOW | WS_VSCROLL, FALSE, 0, dpi)) {
+                AdjustWindowRectEx(&desiredWindow, WS_OVERLAPPEDWINDOW | WS_VSCROLL, FALSE, 0);
             }
             limits->ptMinTrackSize.x = desiredWindow.right - desiredWindow.left;
             limits->ptMinTrackSize.y = desiredWindow.bottom - desiredWindow.top;

@@ -229,6 +229,33 @@ int findTargetIndex(HWND combo, HWND target) {
 }
 
 struct UiWorkflowTests {
+    static void checkScaledLayout(MainWindow& app) {
+        const int originalDpi = app.uiDpi_;
+        RECT original{};
+        GetWindowRect(app.window_, &original);
+        for (int dpi : {144, 192}) {
+            RECT suggested{original.left, original.top, original.left + 510, original.top + 787};
+            SendMessageW(app.window_, WM_DPICHANGED, MAKEWPARAM(dpi, dpi),
+                         reinterpret_cast<LPARAM>(&suggested));
+            RECT client{}, combo{}, refresh{}, hint{};
+            GetClientRect(app.window_, &client);
+            GetWindowRect(app.targetCombo_, &combo);
+            GetWindowRect(GetDlgItem(app.window_, kRefresh), &refresh);
+            GetWindowRect(app.stageHint_, &hint);
+            MapWindowPoints(nullptr, app.window_, reinterpret_cast<POINT*>(&combo), 2);
+            MapWindowPoints(nullptr, app.window_, reinterpret_cast<POINT*>(&refresh), 2);
+            MapWindowPoints(nullptr, app.window_, reinterpret_cast<POINT*>(&hint), 2);
+            require(combo.right <= refresh.left,
+                    "scaled startup layout overlaps target dropdown and Refresh");
+            require(hint.right <= client.right && refresh.right <= client.right,
+                    "scaled startup layout clips controls beyond the client width");
+            UpdateWindow(app.window_);
+            maybeScreenshot(app.window_, dpi == 144 ? "choose-150.png" : "choose-200.png");
+        }
+        SendMessageW(app.window_, WM_DPICHANGED, MAKEWPARAM(originalDpi, originalDpi),
+                     reinterpret_cast<LPARAM>(&original));
+    }
+
     static void run() {
         HINSTANCE instance = GetModuleHandleW(nullptr);
         INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_BAR_CLASSES};
@@ -238,6 +265,7 @@ struct UiWorkflowTests {
         HWND fixture = nullptr;
         try {
             require(app.create(instance), "could not create the real MainWindow");
+            checkScaledLayout(app);
             require(app.uiStage() == MainWindow::UiStage::Choose,
                     "fresh MainWindow should start in Choose stage");
             require(app.selectedTarget() == nullptr,
@@ -268,10 +296,40 @@ struct UiWorkflowTests {
                     "automatic preview should attach a source to the selected target");
             require(app.uiStage() == MainWindow::UiStage::Calibrate,
                     "a captured preview should advance the workflow to calibration");
+            require(!app.scrollbarCandidates_.empty(), "fixture should produce ranked candidates");
+            app.selectScrollbarCandidate(0, true);
+            wchar_t rankText[512]{};
+            GetWindowTextW(app.status_, rankText, 512);
+            const std::wstring selectionText(rankText);
+            require(selectionText.find(L"rank 1 of ") != std::wstring::npos &&
+                    selectionText.find(L"match score ") != std::wstring::npos &&
+                    selectionText.find(L'%') == std::wstring::npos,
+                    "candidate status must show rank and match score, not probability");
+            app.setActivePreviewTool(MainWindow::PreviewTool::Scrollbar);
+            GetWindowTextW(app.previewToolbarLabel_, rankText, 512);
+            require(std::wstring(rankText).find(L"Rank 1 of ") != std::wstring::npos &&
+                    std::wstring(rankText).find(L"best first") != std::wstring::npos,
+                    "preview chooser must explain strongest-first ranking");
+            app.setActivePreviewTool(MainWindow::PreviewTool::CaptureArea);
 
             SetWindowPos(app.previewCanvas_, nullptr, 24, 24, 960, 760,
                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
             UpdateWindow(app.previewCanvas_);
+
+            // A live preview repaint must not erase its independently painted
+            // toolbar children. Test the actual parent DC's clipping region.
+            RECT toolbarButton{};
+            GetWindowRect(app.previewToolCaptureButton_, &toolbarButton);
+            MapWindowPoints(nullptr, app.previewCanvas_,
+                            reinterpret_cast<POINT*>(&toolbarButton), 2);
+            HDC previewDc = GetDC(app.previewCanvas_);
+            require(previewDc != nullptr, "could not inspect preview paint clipping");
+            const bool paintsOverToolbar = PtVisible(previewDc,
+                (toolbarButton.left + toolbarButton.right) / 2,
+                (toolbarButton.top + toolbarButton.bottom) / 2) != FALSE;
+            ReleaseDC(app.previewCanvas_, previewDc);
+            require(!paintsOverToolbar,
+                    "preview repaint can overwrite toolbar child pixels");
 
             const int imageWidth = app.preview_.cols;
             const int imageHeight = app.preview_.rows;

@@ -1,5 +1,63 @@
 // Exercise preview geometry and gesture handlers with hidden Win32 controls.
+//
+// The paint regression test below needs to observe the real destination DC
+// between production GDI operations. These wrappers are test-only compile-time
+// seams around the two operations that matter for this symptom.  They call
+// the real User32/GDI32 exports and sample the window after each FillRect.
+#include <windows.h>
+
+namespace preview_paint_probe {
+
+struct State {
+    bool active = false;
+    HDC destination = nullptr;
+    bool imageBlitStarted = false;
+    int backgroundFrames = 0;
+    int fillOperations = 0;
+    COLORREF background = RGB(20, 23, 29);
+    POINT sample{200, 200};
+};
+
+inline State state{};
+
+} // namespace preview_paint_probe
+
+extern "C" int WINAPI previewTestFillRect(HDC dc, const RECT* rect, HBRUSH brush);
+extern "C" int WINAPI previewTestStretchDIBits(
+    HDC dc, int xDest, int yDest, int destWidth, int destHeight,
+    int xSrc, int ySrc, int srcWidth, int srcHeight, const VOID* bits,
+    const BITMAPINFO* bitmapInfo, UINT usage, DWORD rasterOperation);
+
+#define FillRect previewTestFillRect
+#define StretchDIBits previewTestStretchDIBits
 #include "../src/main.cpp"
+#undef FillRect
+#undef StretchDIBits
+
+extern "C" int WINAPI previewTestFillRect(HDC dc, const RECT* rect, HBRUSH brush) {
+    const int result = ::FillRect(dc, rect, brush);
+    auto& probe = preview_paint_probe::state;
+    // Sample the window surface, even when this operation targets a buffer.
+    // The previously completed frame must stay visible during composition.
+    if (probe.active && probe.destination) {
+        ++probe.fillOperations;
+        if (GetPixel(probe.destination, probe.sample.x, probe.sample.y) == probe.background) {
+            ++probe.backgroundFrames;
+        }
+    }
+    return result;
+}
+
+extern "C" int WINAPI previewTestStretchDIBits(
+    HDC dc, int xDest, int yDest, int destWidth, int destHeight,
+    int xSrc, int ySrc, int srcWidth, int srcHeight, const VOID* bits,
+    const BITMAPINFO* bitmapInfo, UINT usage, DWORD rasterOperation) {
+    auto& probe = preview_paint_probe::state;
+    if (probe.active) probe.imageBlitStarted = true;
+    return ::StretchDIBits(dc, xDest, yDest, destWidth, destHeight,
+                             xSrc, ySrc, srcWidth, srcHeight, bits,
+                             bitmapInfo, usage, rasterOperation);
+}
 
 #include <cmath>
 #include <iostream>
@@ -332,6 +390,78 @@ struct PreviewInteractionTests {
                 "Gesture update outside the canvas did not clamp to source bounds");
     }
 
+    void testPaintDoesNotExposeBackgroundDuringRepaint() {
+        // Use a uniform, unmistakable source pixel so the sampled point can
+        // distinguish the preview background from the image itself.  The
+        // point is inside the fit destination for this 416x416 canvas.
+        app.preview_ = cv::Mat(400, 400, CV_8UC4, cv::Scalar(17, 33, 201, 255));
+        resetGestureState();
+        setRectangles({0, 0, 330, 400}, {350, 0, 20, 400});
+        app.setActivePreviewTool(MainWindow::PreviewTool::CaptureArea);
+        app.fitPreview();
+        ShowWindow(canvas, SW_SHOWNOACTIVATE);
+        SetWindowPos(canvas, nullptr, 0, 0, 416, 416,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(canvas, nullptr, FALSE);
+        app.handlePreviewMessage(canvas, WM_PAINT, 0, 0);
+
+        auto repaintAndObserve = [&]() {
+            preview_paint_probe::state = {};
+            HDC destination = GetDC(canvas);
+            require(destination != nullptr, "Could not sample preview window");
+            const COLORREF before = GetPixel(destination, 200, 200);
+            if (before != RGB(201, 33, 17)) {
+                ReleaseDC(canvas, destination);
+                throw std::runtime_error("Preview sample does not contain the expected source pixel");
+            }
+            preview_paint_probe::state.destination = destination;
+            preview_paint_probe::state.active = true;
+            preview_paint_probe::state.background = RGB(20, 23, 29);
+            preview_paint_probe::state.sample = {200, 200};
+            // This is the production WM_PAINT handler, including its real
+            // BeginPaint/EndPaint destination.  The invalidation makes
+            // BeginPaint own a real update region rather than a synthetic
+            // direct call to paintPreview.
+            InvalidateRect(canvas, nullptr, FALSE);
+            app.handlePreviewMessage(canvas, WM_PAINT, 0, 0);
+            preview_paint_probe::state.active = false;
+            const COLORREF after = GetPixel(destination, 200, 200);
+            ReleaseDC(canvas, destination);
+            require(after == before, "Completed preview repaint lost source pixels");
+            return preview_paint_probe::state;
+        };
+
+        const auto initial = repaintAndObserve();
+        require(initial.destination != nullptr && initial.fillOperations > 0,
+                "WM_PAINT did not reach the real preview destination DC");
+        require(initial.imageBlitStarted,
+                "WM_PAINT did not execute the production preview image blit");
+        require(initial.backgroundFrames == 0,
+                "Preview exposed a blank background between clear and image paint");
+
+        // Repaint through the two user triggers associated with the report:
+        // a drag update and focus loss followed by focus regain.
+        const POINT start = imagePoint(120, 160);
+        app.handlePreviewMessage(canvas, WM_LBUTTONDOWN,
+                                 MK_LBUTTON, MAKELPARAM(start.x, start.y));
+        app.handlePreviewMessage(canvas, WM_MOUSEMOVE,
+                                 MK_LBUTTON, MAKELPARAM(start.x + 12, start.y + 9));
+        const auto dragRepaint = repaintAndObserve();
+        require(dragRepaint.backgroundFrames == 0,
+                "Dragging exposed a blank background during preview repaint");
+
+        app.handlePreviewMessage(canvas, WM_LBUTTONUP, 0,
+                                 MAKELPARAM(start.x + 12, start.y + 9));
+        app.handlePreviewMessage(canvas, WM_ACTIVATE, WA_INACTIVE, 0);
+        const auto inactiveRepaint = repaintAndObserve();
+        require(inactiveRepaint.backgroundFrames == 0,
+                "Inactive preview exposed a blank background during repaint");
+        app.handlePreviewMessage(canvas, WM_ACTIVATE, WA_ACTIVE, 0);
+        const auto focusRepaint = repaintAndObserve();
+        require(focusRepaint.backgroundFrames == 0,
+                "Focus transition exposed a blank background during preview repaint");
+    }
+
     Rect nearbyTrack() const { return app.scrollbarCandidates_[1].config.track; }
 
     void testThinSideHandleAndDpiLayout() {
@@ -369,6 +499,7 @@ struct PreviewInteractionTests {
             tests.testCandidateUndoPreservesManualTrack();
             tests.testUndoDuringDragDoesNotConsumeHistory();
             tests.testInverseMappingAndGestureBounds();
+            tests.testPaintDoesNotExposeBackgroundDuringRepaint();
             require(tests.app.calibrationHistory_.size() <= MainWindow::kPreviewHistoryLimit,
                     "Calibration history exceeded its bound");
         } catch (...) {

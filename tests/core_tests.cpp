@@ -3,6 +3,7 @@
 #include "universal_stitcher/SeamFinder.h"
 #include "universal_stitcher/StitchSession.h"
 #include "universal_stitcher/VerticalShiftEstimator.h"
+#include "../src/stitch/ScrollbarCandidateOrder.h"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 
 using namespace universal_stitcher;
@@ -361,6 +363,82 @@ void testMultipleScrollbarCandidates() {
     require(best.has_value(), "legacy best-candidate API should remain available");
 }
 
+void testStrongestScrollbarRunWins() {
+    for (bool strongFirst : {true, false}) {
+        cv::Mat frame(240, 40, CV_8UC4, cv::Scalar(210, 210, 210, 255));
+        const int strongY = strongFirst ? 30 : 150;
+        const int weakY = strongFirst ? 150 : 30;
+        frame(cv::Rect(28, strongY, 8, 24)).setTo(cv::Scalar(40, 40, 40, 255));
+        frame(cv::Rect(28, weakY, 8, 24)).setTo(cv::Scalar(190, 190, 190, 255));
+        const auto observation = ScrollbarDetector::detect(
+            frame, {{28, 0, 8, 240}, ScrollbarSide::Right, true});
+        require(observation.detected && observation.thumbTop() == strongY &&
+                    observation.thumb.height == 24,
+                "strongest thumb must win regardless of whether a weaker decoy appears later");
+    }
+}
+
+void testScrollbarRankingIsStrictAndStable() {
+    std::vector<ScrollbarCandidate> candidates(4);
+    for (int i = 0; i < 4; ++i) {
+        candidates[i].config = {{30, 10 + i, 8, 200}, ScrollbarSide::Right, true};
+        candidates[i].observation = {true, {30, 40, 8, 25}, 0.9F - i * 0.1F};
+        candidates[i].autoDetectionScore = 0.5000F + i * 0.0006F;
+    }
+    // These near-ties formed a comparison cycle under the epsilon comparator.
+    const auto before = detail::scrollbarCandidateBefore;
+    for (const auto& a : candidates) {
+        require(!before(a, a), "candidate ranking must be irreflexive");
+        for (const auto& b : candidates) for (const auto& c : candidates) {
+            require(!(before(a, b) && before(b, c)) || before(a, c),
+                    "candidate ranking must be transitive across near-ties");
+        }
+    }
+    std::vector<int> order{0, 1, 2, 3};
+    do {
+        std::vector<ScrollbarCandidate> shuffled;
+        for (int index : order) shuffled.push_back(candidates[index]);
+        std::sort(shuffled.begin(), shuffled.end(), before);
+        for (int i = 0; i < 4; ++i)
+            require(shuffled[i].config.track.y == 13 - i,
+                    "ranking must be strongest-first for every input permutation");
+    } while (std::next_permutation(order.begin(), order.end()));
+
+    auto a = candidates[0], b = a;
+    b.config.track.y += 1;
+    require(before(a, b) && !before(b, a), "equal scores need stable geometry tie-breakers");
+    b.autoDetectionScore = std::numeric_limits<float>::quiet_NaN();
+    require(before(a, b) && !before(b, a), "invalid scores must rank below finite scores");
+
+    const auto detected = ScrollbarDetector::autoDetectAll(multipleScrollbarFrame());
+    require(std::is_sorted(detected.begin(), detected.end(), before),
+            "published distinct candidates must retain strongest-first order");
+}
+
+void testLongNeutralThumbDiscoveryAndTrackingAgree() {
+    const ScrollbarConfig config{{280, 60, 8, 200}, ScrollbarSide::Right, true};
+    for (int thumbHeight : {150, 172, 190}) {
+        for (int offset : {0, (200 - thumbHeight) / 2, 200 - thumbHeight}) {
+            cv::Mat frame(320, 640, CV_8UC4, cv::Scalar(255, 255, 255, 255));
+            frame(cv::Rect(280, 60, 8, 200)).setTo(cv::Scalar(214, 214, 214, 255));
+            frame(cv::Rect(280, 60 + offset, 8, thumbHeight)).setTo(cv::Scalar(128, 128, 128, 255));
+            const auto tracked = ScrollbarDetector::detect(frame, config);
+            require(tracked.detected && tracked.thumb.y == 60 + offset && tracked.thumb.height == thumbHeight,
+                    "majority-height thumb must not invert into exposed track gaps");
+            const auto candidates = ScrollbarDetector::autoDetectAll(frame);
+            require(!candidates.empty(), "long interior thumb must remain discoverable");
+            const auto& best = candidates.front();
+            require(best.config.track.x >= 278 && best.config.track.x <= 283 &&
+                    best.config.track.y == 60 && best.config.track.height == 200,
+                    "long-thumb track must exclude white header and footer");
+            const auto retracked = ScrollbarDetector::detect(frame, best.config);
+            require(retracked.thumb.y == best.observation.thumb.y &&
+                    retracked.thumb.height == best.observation.thumb.height,
+                    "discovery and tracking must share the long-thumb interpretation");
+        }
+    }
+}
+
 void testGrayGameScrollbarRanksFirst() {
     const auto candidates = ScrollbarDetector::autoDetectAll(grayGameScrollbarFrame());
     require(!candidates.empty(), "gray game scrollbar should be detected");
@@ -659,6 +737,9 @@ int main() {
     testSmoothScrollAdjacentShiftsAreOnePeak();
     testDisagreementIsRejected();
     testScrollbarDetection();
+    testStrongestScrollbarRunWins();
+    testScrollbarRankingIsStrictAndStable();
+    testLongNeutralThumbDiscoveryAndTrackingAgree();
     testMultipleScrollbarCandidates();
     testGrayGameScrollbarRanksFirst();
     testInteriorScrollbarIsSelectable();

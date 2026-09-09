@@ -1,4 +1,5 @@
 #include "universal_stitcher/ScrollbarDetector.h"
+#include "ScrollbarCandidateOrder.h"
 
 #include <opencv2/imgproc.hpp>
 
@@ -77,6 +78,7 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
     const int minimumRun = std::max(4, std::min(24, track.height / 100));
 
     RunResult best;
+    float bestScore = -1.0F;
     int bestLocalTop = -1;
     int bestLocalBottom = -1;
     int runStart = -1;
@@ -96,7 +98,8 @@ RunResult findRun(const cv::Mat& bgra, const Rect& requested) {
                 for (int row = completedStart; row < runEnd; ++row) peak = std::max(peak, deviations[static_cast<std::size_t>(row)]);
                 const float compactness = 1.0F - std::fabs(static_cast<float>(length) - track.height * 0.12F) / std::max(1.0F, track.height * 0.88F);
                 const float score = peak * (0.65F + 0.35F * std::max(0.0F, compactness));
-                if (score > best.confidence) {
+                if (score > bestScore) {
+                    bestScore = score;
                     best.top = completedStart + track.y;
                     best.bottom = runEnd + track.y;
                     best.confidence = std::clamp(score / 64.0F, 0.0F, 1.0F);
@@ -144,9 +147,14 @@ float candidateSelectionScore(const cv::Mat& bgra, const ScrollbarCandidate& can
     std::uint64_t thumbPixels = 0;
     double backgroundLuma = 0.0;
     std::uint64_t backgroundPixels = 0;
+    double horizontalVariation = 0.0;
     for (int y = track.y; y < track.bottom(); ++y) {
         const auto* row = bgra.ptr<cv::Vec4b>(y);
+        float rowMinimum = 255.0F, rowMaximum = 0.0F;
         for (int x = track.x; x < track.right(); ++x) {
+            const float value = luma(row[x]);
+            rowMinimum = std::min(rowMinimum, value);
+            rowMaximum = std::max(rowMaximum, value);
             const bool insideThumb = x >= thumb.x && x < thumb.right() &&
                                      y >= thumb.y && y < thumb.bottom();
             if (insideThumb) {
@@ -159,6 +167,7 @@ float candidateSelectionScore(const cv::Mat& bgra, const ScrollbarCandidate& can
                 ++backgroundPixels;
             }
         }
+        horizontalVariation += rowMaximum - rowMinimum;
     }
     if (thumbPixels == 0 || backgroundPixels == 0) return candidate.observation.confidence;
 
@@ -187,20 +196,23 @@ float candidateSelectionScore(const cv::Mat& bgra, const ScrollbarCandidate& can
         std::clamp(std::fabs(averageTrackLuma - 214.0F) / 42.0F, 0.0F, 1.0F);
     const float thumbTone = 1.0F -
         std::clamp(std::fabs(thumbLuma - 128.0F) / 80.0F, 0.0F, 1.0F);
-    const float edgeDistance = candidate.config.side == ScrollbarSide::Right
-        ? static_cast<float>(bgra.cols - track.right()) / std::max(1, bgra.cols)
-        : static_cast<float>(track.x) / std::max(1, bgra.cols);
-    const float edgeProximity = 1.0F - std::clamp(edgeDistance * 8.0F, 0.0F, 1.0F);
+    // Distance to the top-level window edge says nothing about whether an
+    // interior pane owns a scrollbar. Rewarding it promoted frame shadows
+    // above real scrollbars in wide layouts.
     const float trackCoverage = std::clamp(
         static_cast<float>(track.height) / std::max(1.0F, bgra.rows * 0.45F), 0.0F, 1.0F);
     const int insetThreshold = std::max(2, bgra.rows / 100);
     const float interiorTrack = track.y >= insetThreshold &&
                                 bgra.rows - track.bottom() >= insetThreshold ? 1.0F : 0.0F;
     const float conventionalSide = candidate.config.side == ScrollbarSide::Right ? 0.05F : 0.0F;
+    // A strip straddling content and a scrollbar can fake a strong vertical
+    // profile. Prefer coherent cross-sections over these mixed partial hits.
+    const float mixedStripPenalty = 0.15F * std::clamp(
+        static_cast<float>(horizontalVariation / track.height) / 64.0F, 0.0F, 1.0F);
     return std::clamp(candidate.observation.confidence * 0.28F + neutrality * 0.15F +
-                      contrast * 0.12F + edgeProximity * 0.10F + trackCoverage * 0.12F +
+                      contrast * 0.12F + trackCoverage * 0.12F +
                       trackTone * 0.10F + thumbTone * 0.08F + conventionalSide -
-                      whiteTrackPenalty + interiorTrack * 0.08F,
+                      whiteTrackPenalty + interiorTrack * 0.08F - mixedStripPenalty,
                       0.0F, 1.0F);
 }
 
@@ -208,7 +220,7 @@ void collectNeutralGrayCandidates(const cv::Mat& bgra, int candidateWidth,
                                   int firstX, int lastX, int leftSideBoundary,
                                   std::vector<ScrollbarCandidate>& candidates) {
     const int minimumThumbHeight = std::max(4, std::min(24, bgra.rows / 100));
-    const int maximumThumbHeight = static_cast<int>(bgra.rows * 0.60F);
+    const int maximumThumbHeight = bgra.rows - 8;
     for (int x = firstX; x <= lastX; ++x) {
         std::vector<float> rowLuma(static_cast<std::size_t>(bgra.rows));
         std::vector<float> rowChroma(static_cast<std::size_t>(bgra.rows));
@@ -280,7 +292,7 @@ void collectNeutralGrayCandidates(const cv::Mat& bgra, int candidateWidth,
             while (trackBottom < bgra.rows &&
                    (isThumbRow(trackBottom) || isTrackRow(trackBottom))) ++trackBottom;
             const int trackHeight = trackBottom - trackTop;
-            if (trackHeight < std::max(64, thumbHeight + std::max(8, thumbHeight / 3))) continue;
+            if (trackHeight < std::max(64, thumbHeight + 8)) continue;
 
             ScrollbarCandidate candidate{
                 {{x, trackTop, candidateWidth, trackHeight},
@@ -350,25 +362,7 @@ std::vector<ScrollbarCandidate> ScrollbarDetector::autoDetectAll(const cv::Mat& 
                                      leftSideBoundary, candidates);
     }
 
-    std::sort(candidates.begin(), candidates.end(), [](const ScrollbarCandidate& left,
-                                                       const ScrollbarCandidate& right) {
-        if (std::fabs(left.autoDetectionScore - right.autoDetectionScore) > 0.001F) {
-            return left.autoDetectionScore > right.autoDetectionScore;
-        }
-        if (std::fabs(left.observation.confidence - right.observation.confidence) > 0.001F) {
-            return left.observation.confidence > right.observation.confidence;
-        }
-        if (left.config.side != right.config.side) {
-            return left.config.side == ScrollbarSide::Right;
-        }
-        // Saturated confidence scores are common for high-contrast thumbs.
-        // Prefer the strip closest to its declared window edge so the chosen
-        // cluster representative covers the complete scrollbar rather than a
-        // partial overlap with neighboring content.
-        return left.config.side == ScrollbarSide::Left
-            ? left.config.track.x < right.config.track.x
-            : left.config.track.x > right.config.track.x;
-    });
+    std::sort(candidates.begin(), candidates.end(), detail::scrollbarCandidateBefore);
 
     // Sliding a narrow detector across one scrollbar creates several nearly
     // identical hits. Keep only the strongest member of each horizontal
@@ -398,6 +392,20 @@ ScrollbarObservation ScrollbarDetector::detect(const cv::Mat& bgra, const Scroll
     if (!config.enabled || bgra.empty() || bgra.type() != CV_8UC4) return {};
     const Rect track = config.track.clampTo(bgra.cols, bgra.rows);
     if (!track.valid()) return {};
+    // A thumb can occupy most of its track. In that case the median profile
+    // becomes the thumb, so use the same locally bounded neutral proposal as
+    // discovery when it explains the full supplied track.
+    std::vector<ScrollbarCandidate> localCandidates;
+    const cv::Mat local = bgra(cv::Rect(track.x, track.y, track.width, track.height));
+    collectNeutralGrayCandidates(local, track.width, 0, 0, 0, localCandidates);
+    std::sort(localCandidates.begin(), localCandidates.end(), detail::scrollbarCandidateBefore);
+    for (const auto& candidate : localCandidates) {
+        if (candidate.config.track.height < track.height - std::max(4, track.height / 20)) continue;
+        Rect thumb = candidate.observation.thumb;
+        thumb.x += track.x;
+        thumb.y += track.y;
+        return {true, thumb, candidate.observation.confidence};
+    }
     const RunResult run = findRun(bgra, track);
     if (run.bottom <= run.top) return {};
     return {true, {track.x, run.top, track.width, run.bottom - run.top}, run.confidence};
