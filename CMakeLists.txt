@@ -74,7 +74,7 @@ if (WIN32)
         src/capture/GraphicsCaptureSource.cpp
     )
     target_include_directories(UniversalScrollStitcher PRIVATE include)
-    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export diagnostic_logger user32 gdi32 shcore dwmapi comdlg32 comctl32 shell32)
+    target_link_libraries(UniversalScrollStitcher PRIVATE stitch_core stitch_export diagnostic_logger user32 gdi32 msimg32 shcore dwmapi comdlg32 comctl32 shell32)
     target_compile_definitions(UniversalScrollStitcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     copy_opencv_runtime(UniversalScrollStitcher)
 
@@ -99,6 +99,7 @@ if (WIN32)
         install(FILES ${UNIVERSAL_STITCHER_OPENCV_RUNTIME_DLLS} DESTINATION .)
     endif()
     install(FILES README.md DESTINATION .)
+    install(FILES docs/images/setup.png docs/images/preview.png DESTINATION docs/images)
     foreach(dependency IN ITEMS cppwinrt libjpeg-turbo libpng opencv4 zlib)
         set(dependency_notice
             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/${dependency}/copyright")
@@ -122,10 +123,17 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
         add_executable(stitch_preview_tests tests/preview_tests.cpp
             src/capture/WindowCapture.cpp src/capture/GraphicsCaptureSource.cpp)
         target_link_libraries(stitch_preview_tests PRIVATE stitch_core stitch_export diagnostic_logger
-            user32 gdi32 shcore dwmapi comdlg32 comctl32 shell32)
+            user32 gdi32 msimg32 shcore dwmapi comdlg32 comctl32 shell32)
         target_compile_definitions(stitch_preview_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
         copy_opencv_runtime(stitch_preview_tests)
         add_test(NAME stitch_preview_tests COMMAND stitch_preview_tests)
+        add_executable(stitch_ui_workflow_tests tests/ui_workflow_tests.cpp
+            src/capture/WindowCapture.cpp src/capture/GraphicsCaptureSource.cpp)
+        target_link_libraries(stitch_ui_workflow_tests PRIVATE stitch_core stitch_export diagnostic_logger
+            user32 gdi32 msimg32 shcore dwmapi comdlg32 comctl32 shell32)
+        target_compile_definitions(stitch_ui_workflow_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+        copy_opencv_runtime(stitch_ui_workflow_tests)
+        add_test(NAME stitch_ui_workflow_tests COMMAND stitch_ui_workflow_tests)
         add_executable(stitch_logger_tests tests/logger_tests.cpp)
         target_link_libraries(stitch_logger_tests PRIVATE diagnostic_logger)
         target_include_directories(stitch_logger_tests PRIVATE include)
@@ -136,7 +144,7 @@ if (BUILD_TESTING AND UNIVERSAL_STITCHER_BUILD_TESTS)
         add_test(NAME stitch_export_tests COMMAND stitch_export_tests)
         copy_opencv_runtime(stitch_core_tests)
         copy_opencv_runtime(stitch_export_tests)
-        set_tests_properties(stitch_core_tests stitch_logger_tests stitch_export_tests
+        set_tests_properties(stitch_core_tests stitch_logger_tests stitch_export_tests stitch_preview_tests stitch_ui_workflow_tests
             PROPERTIES RUN_SERIAL TRUE)
     endif()
 endif()
